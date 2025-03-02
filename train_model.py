@@ -122,7 +122,7 @@ class QAEvaluationCallback(TrainerCallback):
                 correct_answer = eval_dataset[i][a_field]
                 
                 prompt, correct_option = create_multiple_choice_prompt(
-                    question, correct_answer, eval_dataset, self.tokenizer
+                    question, correct_answer, eval_dataset
                 )
                 
                 if prompt and correct_option:
