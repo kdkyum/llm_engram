@@ -274,7 +274,7 @@ def main():
     
     # Configure model output directory to include model name
     model_name_safe = args.model_name_or_path.replace("/", "-")
-    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}")
+    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}-ep{args.num_train_epochs}")
     os.makedirs(output_dir, exist_ok=True)
     
     # Initialize wandb
@@ -317,7 +317,8 @@ def main():
         args.model_name_or_path, 
         device_map="auto",
         use_cache=False,
-        torch_dtype=torch.float16 if args.fp16 else torch.float32
+        # Change dtype based on model type and fp16 flag
+        torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"] else torch.float32
     )
     
     if args.freeze_embeddings:
@@ -354,8 +355,16 @@ def main():
                 """Force embedding output to require gradients, even if embeddings are frozen."""
                 output.requires_grad_(True)
                 return output
-            # Register forward hook to ensure embedding output requires gradients
-            model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
+            
+            # Register forward hook based on model type
+            if args.model_type == "gpt-j":
+                model.transformer.wte.register_forward_hook(embedding_forward_hook)
+            elif args.model_type == "llama":
+                model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
+            elif args.model_type == "gpt2":
+                model.transformer.wte.register_forward_hook(embedding_forward_hook)
+            elif args.model_type == "gpt-neox":
+                model.gpt_neox.embed_in.register_forward_hook(embedding_forward_hook)
         
         model.gradient_checkpointing_enable()
     
@@ -371,7 +380,7 @@ def main():
     bio_field = args.bio_field
     tokenized_train = BioDataset(train_dataset, tokenizer, bio_field, debug=args.debug)
     
-    # Configure training
+    # Configure training with updated mixed precision settings
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -383,9 +392,13 @@ def main():
         eval_strategy="no",  # We'll do our own evaluation with the callback
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
         report_to="wandb",
-        gradient_checkpointing=args.gradient_checkpointing,  # Enable gradient checkpointing
-        warmup_steps=args.warmup_steps,  # Add warmup steps
-        fp16=args.fp16,
+        gradient_checkpointing=args.gradient_checkpointing,
+        warmup_steps=0,  # No warmup steps for constant learning rate
+        lr_scheduler_type="constant",  # Use constant learning rate
+        # Update mixed precision settings
+        fp16=args.fp16 and args.model_type == "gpt2",  # Use fp16 only for gpt2
+        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"],  # Use bf16 for llama, gpt-j, and gpt-neox
+        half_precision_backend="auto"
     )
             
     # Create a custom data collator
