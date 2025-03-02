@@ -400,13 +400,16 @@ def main():
             self.max_length = max_length
             self.debug = debug
             
-            # Create a flat list of examples if using bioS_multi5_permutes
+            # Create a flat list of examples
             self.examples = []
             if bio_field == "bioS_multi5_permutes":
                 for idx in range(len(dataset)):
-                    for permutes in dataset[idx][bio_field]:
-                        for text in permutes:
-                            self.examples.append(text)
+                    # Each dataset item contains a list of 5 permutations
+                    # Each permutation is a complete biography text (not to be split further)
+                    for permutation in dataset[idx][bio_field]:
+                        # Add each complete permutation as a separate example
+                        if isinstance(permutation, str):
+                            self.examples.append(permutation)
             else:
                 for idx in range(len(dataset)):
                     self.examples.append(dataset[idx][bio_field])
