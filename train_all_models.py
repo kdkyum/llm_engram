@@ -7,13 +7,13 @@ from datetime import datetime
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train multiple LLM models")
-    parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--num_train_epochs", type=int, default=40, help="Number of training epochs")
     parser.add_argument("--max_samples", type=int, default=100, help="Maximum number of samples to use from dataset")
     parser.add_argument("--eval_samples", type=int, default=100, help="Number of samples to use for evaluation")
     parser.add_argument("--bio_field", type=str, default="bioS", help="Which bio field to use for training")
-    parser.add_argument("--fp16", action="store_true", help="Use mixed precision training")
-    parser.add_argument("--lora", action="store_true", help="Use LoRA for efficient fine-tuning")
     parser.add_argument("--run_lr_sweep", action="store_true", help="Run learning rate sweep for each model")
+    parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
     parser.add_argument("--base_output_dir", type=str, default="./model-output", help="Base directory to save models")
     return parser.parse_args()
 
@@ -28,13 +28,13 @@ def main():
         {"name": "gpt2-large", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
         {"name": "gpt2-xl", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
         # GPT-J and GPT-NeoX models
-        {"name": "EleutherAI/gpt-j-6B", "type": "gpt-j", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1},
-        # {"name": "EleutherAI/gpt-neox-20b", "type": "gpt-neox", "default_lr": 1e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1},
+        {"name": "EleutherAI/gpt-j-6B", "type": "gpt-j", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True},
+        # {"name": "EleutherAI/gpt-neox-20b", "type": "gpt-neox", "default_lr": 1e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True},
         
         # Large models with LORA only
-        # {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 5e-3, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True},
-        # {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 5e-3, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True},
-        {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 5e-3, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True},
+        # {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "eval_batch_size": 1},
     ]
     
     # Define learning rates for hyperparameter sweep if enabled
@@ -46,8 +46,8 @@ def main():
             # Create a range: 1x, 2x, and 5x the default learning rate
             lr_values.extend([
                 default_lr,
-                default_lr * 2.0,
-                default_lr * 5
+                default_lr / 2.0,
+                default_lr / 5.0
             ])
         # Remove duplicates and sort
         lr_values = sorted(list(set(lr_values)))
@@ -66,6 +66,8 @@ def main():
         gradient_accumulation_steps = model_info["gradient_accumulation_steps"]
         per_device_train_batch_size = model_info["per_device_train_batch_size"]
         fp16 = model_info.get("fp16", False)
+        gradient_checkpointing = model_info.get("gradient_checkpointing", False)
+        eval_batch_size = model_info.get("eval_batch_size", 16)
         
         # Get short name for directories
         model_short_name = model_name.split("/")[-1] if "/" in model_name else model_name
@@ -101,6 +103,7 @@ def main():
                 "--gradient_accumulation_steps", str(gradient_accumulation_steps),
                 "--max_samples", str(args.max_samples),
                 "--eval_samples", str(args.eval_samples),
+                "--eval_batch_size", str(eval_batch_size),
                 "--bio_field", args.bio_field,
                 "--output_dir", output_dir,
                 "--wandb_run_name", f"{model_short_name}-{args.bio_field}-lr{lr_str}",
@@ -108,10 +111,10 @@ def main():
             ]
             
             if args.fp16 or fp16:
-                cmd.append("--bf16")  # Use bf16 instead of fp16
-                
-            if args.lora:
-                cmd.append("--lora")
+                cmd.append("--fp16")
+
+            if args.gradient_checkpointing or gradient_checkpointing:
+                cmd.append("--gradient_checkpointing")
             
             # Run training
             try:

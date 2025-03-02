@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Modified training script that fixes the FP16 gradient issues.
-This script should be used for training larger models with mixed precision.
-"""
 
 import os
 import argparse
@@ -17,7 +13,6 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
-    EvalPrediction
 )
 import wandb
 from tqdm import tqdm
@@ -164,6 +159,82 @@ class QAEvaluationCallback(TrainerCallback):
         
         return results
 
+
+class BioDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, tokenizer, bio_field, max_length=256, debug=False):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.bio_field = bio_field
+        self.max_length = max_length
+        self.debug = debug
+        
+        # Create a flat list of examples
+        self.examples = []
+        if bio_field == "bioS_multi5_permutes":
+            for idx in range(len(dataset)):
+                # Each dataset item contains a list of 5 permutations
+                # Each permutation is a complete biography text (not to be split further)
+                for permutation in dataset[idx][bio_field]:
+                    # Add each complete permutation as a separate example
+                    if isinstance(permutation, str):
+                        self.examples.append(permutation)
+        else:
+            for idx in range(len(dataset)):
+                self.examples.append(dataset[idx][bio_field])
+        
+        # Debug: print first few examples
+        if debug:
+            print("\n=== DEBUG: BioDataset Examples ===")
+            print(f"Total examples: {len(self.examples)}")
+            for i in range(min(3, len(self.examples))):
+                print(f"\nExample {i}:")
+                print(self.examples[i])
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, idx):
+        text = self.examples[idx]
+        inputs = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors=None  # Don't convert to tensors yet
+        )
+        
+        # Convert input_ids to tensors to catch any issues early
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        
+        # Create labels for causal LM (same as input_ids)
+        inputs["labels"] = input_ids.copy()
+        
+        # Debug: print tokenization details for the first example
+        if self.debug and idx == 0:
+            print("\n=== DEBUG: Example Tokenization ===")
+            print(f"Original text: {text[:100]}...")  # Show beginning of text
+            print(f"Input IDs: {input_ids[:50]}...")  # Show first 50 tokens
+            
+            # Print actual tokens
+            tokens = self.tokenizer.convert_ids_to_tokens(input_ids[:50])
+            print("\nFirst 50 tokens:")
+            for i, (token, token_id) in enumerate(zip(tokens, input_ids[:50])):
+                print(f"Position {i}: '{token}' (ID: {token_id})")
+            
+            # Show attention mask
+            print(f"\nAttention Mask (first 50): {attention_mask[:50]}")
+            
+            # Show where padding starts
+            if 0 in attention_mask:
+                pad_pos = attention_mask.index(0)
+                print(f"Padding starts at position {pad_pos}")
+            else:
+                print("No padding in this example")
+        
+        return inputs
+    
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune language models on bioS dataset")
     parser.add_argument("--output_dir", type=str, default="./model-output", help="Directory to save model")
@@ -177,7 +248,6 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps")
     parser.add_argument("--save_steps", type=int, default=1000, help="Save steps")
-    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision training")
     parser.add_argument("--bio_field", type=str, default="bioS", help="Which bio field to use for training (bioS, bioS_fullname, or bioS_multi5_permutes)")
     parser.add_argument("--wandb_project", type=str, default="llm-engram", help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
@@ -186,7 +256,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max_samples", type=int, default=100, help="Maximum number of samples to use from dataset")
     parser.add_argument("--freeze_embeddings", action="store_true", help="Freeze model embeddings")
-    parser.add_argument("--lora", action="store_true", help="Use LoRA for parameter-efficient fine-tuning")
+    parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
     parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps for learning rate scheduler")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
     return parser.parse_args()
@@ -242,144 +313,51 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load model with appropriate configuration
-    if args.model_type in ["gpt-j", "gpt-neox", "llama"]:
-        # For larger models, use additional configurations and BF16
-        torch_dtype = torch.float16 if args.bf16 else torch.float32
-
-        if "gpt" in args.model_type:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                device_map="auto",
-                torch_dtype=torch_dtype,
-            )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path, 
+        device_map="auto",
+        use_cache=False,
+        torch_dtype=torch.float16 if args.fp16 else torch.float32
+    )
+    
+    if args.freeze_embeddings:
+        print("Freezing model embeddings...")
+        if args.model_type == "gpt-j":
+            # GPT-J specific
+            for param in model.transformer.wte.parameters():
+                param.requires_grad = False
+            for param in model.lm_head.parameters():
+                param.requires_grad = False
+        elif args.model_type == "gpt-neox":
+            # GPT-NeoX specific
+            for param in model.gpt_neox.embed_in.parameters():
+                param.requires_grad = False
+            for param in model.embed_out.parameters():
+                param.requires_grad = False
         elif args.model_type == "llama":
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-        
-        # For LoRA, we need to import PEFT
-        if args.lora:
-            try:
-                from peft import LoraConfig, get_peft_model, TaskType
-                print("Using LoRA for parameter-efficient fine-tuning")
-                
-                # Define the target modules based on model type
-                if args.model_type == "gpt-j":
-                    target_modules = ["q_proj", "v_proj", "k_proj", "out_proj"]
-                elif args.model_type == "gpt-neox":
-                    target_modules = ["query_key_value", "dense"]
-                elif args.model_type == "llama":
-                    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-                else:
-                    target_modules = None
-                    
-                # Setup LoRA configuration
-                lora_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=8,
-                    lora_alpha=16,
-                    lora_dropout=0.05,
-                    target_modules=target_modules
-                )
-                
-                # Prepare model for LoRA fine-tuning and ensure gradients are enabled
-                # This explicitly sets requires_grad=True for input embeddings
-                if hasattr(model, "enable_input_require_grads"):
-                    model.enable_input_require_grads()
-                else:
-                    def make_inputs_require_grad(module, input, output):
-                        output.requires_grad_(True)
-                    model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-                    
-                # Make sure model inputs have requires_grad=True during forward pass
-                for param in model.parameters():
-                    if param.requires_grad:
-                        # At least one parameter needs to have requires_grad=True 
-                        # This ensures we don't hit the UserWarning about "None of the inputs have requires_grad=True"
-                        break
-                
-                # Apply LoRA to the model
-                model = get_peft_model(model, lora_config)
-                model.print_trainable_parameters()
-                
-            except ImportError:
-                raise ImportError(
-                    "PEFT library not found. Please install it with: pip install peft"
-                )
-        # If not using LoRA, freeze the embeddings
-        elif args.freeze_embeddings:
-            print("Freezing model embeddings...")
-            if args.model_type == "gpt-j":
-                # GPT-J specific
-                for param in model.transformer.wte.parameters():
-                    param.requires_grad = False
-                for param in model.lm_head.parameters():
-                    param.requires_grad = False
-            elif args.model_type == "gpt-neox":
-                # GPT-NeoX specific
-                for param in model.gpt_neox.embed_in.parameters():
-                    param.requires_grad = False
-                for param in model.embed_out.parameters():
-                    param.requires_grad = False
-            elif args.model_type == "llama":
-                for param in model.model.embed_tokens.parameters():
-                    param.requires_grad = False
-                for param in model.lm_head.parameters():
-                    param.requires_grad = False
-    else:
-        # For GPT-2 models
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            use_cache=False  # Disable KV cache for compatibility with gradient checkpointing
-        )
-        
-        # If using LoRA for GPT-2
-        if args.lora:
-            try:
-                from peft import LoraConfig, get_peft_model, TaskType
-                print("Using LoRA for parameter-efficient fine-tuning")
-                
-                lora_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=8,
-                    lora_alpha=16,
-                    lora_dropout=0.05,
-                    target_modules=["c_attn", "c_proj"]
-                )
-                
-                # This explicitly sets requires_grad=True for input embeddings
-                if hasattr(model, "enable_input_require_grads"):
-                    model.enable_input_require_grads()
-                else:
-                    def make_inputs_require_grad(module, input, output):
-                        output.requires_grad_(True)
-                    model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-                
-                # Make sure model inputs have requires_grad=True during forward pass
-                for param in model.parameters():
-                    if param.requires_grad:
-                        # At least one parameter needs to have requires_grad=True 
-                        # This ensures we don't hit the UserWarning about "None of the inputs have requires_grad=True"
-                        break
-                
-                model = get_peft_model(model, lora_config)
-                model.print_trainable_parameters()
-                
-            except ImportError:
-                raise ImportError(
-                    "PEFT library not found. Please install it with: pip install peft"
-                )
-        # If not using LoRA, freeze the embeddings
-        elif args.freeze_embeddings:
-            print("Freezing model embeddings...")
+            for param in model.model.embed_tokens.parameters():
+                param.requires_grad = False
+            for param in model.lm_head.parameters():
+                param.requires_grad = False
+        elif args.model_type == "gpt2":
             for param in model.transformer.wte.parameters():
                 param.requires_grad = False
             for param in model.transformer.wpe.parameters():
                 param.requires_grad = False
             for param in model.lm_head.parameters():
                 param.requires_grad = False
+
+    if args.gradient_checkpointing:
+        print("Enabling gradient checkpointing...")
+        if args.freeze_embeddings:
+            def embedding_forward_hook(module, input, output):
+                """Force embedding output to require gradients, even if embeddings are frozen."""
+                output.requires_grad_(True)
+                return output
+            # Register forward hook to ensure embedding output requires gradients
+            model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
+        
+        model.gradient_checkpointing_enable()
     
     # Print trainable parameters info
     total_params = sum(p.numel() for p in model.parameters())
@@ -391,84 +369,6 @@ def main():
     # Tokenize data
     print("Tokenizing data...")
     bio_field = args.bio_field
-    
-    # Prepare a dataset class that will properly tokenize our data
-    class BioDataset(torch.utils.data.Dataset):
-        def __init__(self, dataset, tokenizer, bio_field, max_length=256, debug=False):
-            self.dataset = dataset
-            self.tokenizer = tokenizer
-            self.bio_field = bio_field
-            self.max_length = max_length
-            self.debug = debug
-            
-            # Create a flat list of examples
-            self.examples = []
-            if bio_field == "bioS_multi5_permutes":
-                for idx in range(len(dataset)):
-                    # Each dataset item contains a list of 5 permutations
-                    # Each permutation is a complete biography text (not to be split further)
-                    for permutation in dataset[idx][bio_field]:
-                        # Add each complete permutation as a separate example
-                        if isinstance(permutation, str):
-                            self.examples.append(permutation)
-            else:
-                for idx in range(len(dataset)):
-                    self.examples.append(dataset[idx][bio_field])
-            
-            # Debug: print first few examples
-            if debug:
-                print("\n=== DEBUG: BioDataset Examples ===")
-                print(f"Total examples: {len(self.examples)}")
-                for i in range(min(3, len(self.examples))):
-                    print(f"\nExample {i}:")
-                    print(self.examples[i])
-        
-        def __len__(self):
-            return len(self.examples)
-        
-        def __getitem__(self, idx):
-            text = self.examples[idx]
-            inputs = self.tokenizer(
-                text,
-                truncation=True,
-                max_length=self.max_length,
-                padding="max_length",
-                return_tensors=None  # Don't convert to tensors yet
-            )
-            
-            # Convert input_ids to tensors to catch any issues early
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
-            
-            # Create labels for causal LM (same as input_ids)
-            inputs["labels"] = input_ids.copy()
-            
-            # Debug: print tokenization details for the first example
-            if self.debug and idx == 0:
-                print("\n=== DEBUG: Example Tokenization ===")
-                print(f"Original text: {text[:100]}...")  # Show beginning of text
-                print(f"Input IDs: {input_ids[:50]}...")  # Show first 50 tokens
-                
-                # Print actual tokens
-                tokens = self.tokenizer.convert_ids_to_tokens(input_ids[:50])
-                print("\nFirst 50 tokens:")
-                for i, (token, token_id) in enumerate(zip(tokens, input_ids[:50])):
-                    print(f"Position {i}: '{token}' (ID: {token_id})")
-                
-                # Show attention mask
-                print(f"\nAttention Mask (first 50): {attention_mask[:50]}")
-                
-                # Show where padding starts
-                if 0 in attention_mask:
-                    pad_pos = attention_mask.index(0)
-                    print(f"Padding starts at position {pad_pos}")
-                else:
-                    print("No padding in this example")
-            
-            return inputs
-    
-    # Create dataset
-    print(f"Creating dataset from {len(train_dataset)} examples...")
     tokenized_train = BioDataset(train_dataset, tokenizer, bio_field, debug=args.debug)
     
     # Configure training
@@ -478,52 +378,42 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        bf16=args.bf16,  # Use bf16 instead of fp16
-        fp16=False,      # Disable fp16 to avoid the "unscale FP16 gradients" error
         logging_steps=args.logging_steps,
         save_strategy="no",  # Don't save model every epoch
-        evaluation_strategy="no",  # We'll do our own evaluation with the callback
+        eval_strategy="no",  # We'll do our own evaluation with the callback
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
         report_to="wandb",
+        gradient_checkpointing=args.gradient_checkpointing,  # Enable gradient checkpointing
         warmup_steps=args.warmup_steps,  # Add warmup steps
+        fp16=args.fp16,
     )
-    
-    # Use a simplified data collator that won't conflict with our dataset
-    class SimpleDataCollator:
-        def __init__(self, pad_token_id):
-            self.pad_token_id = pad_token_id
-            
-        def __call__(self, features):
-            batch = {}
-            
-            # Get all keys from the first feature
-            keys = features[0].keys()
-            
-            for key in keys:
-                if key == "labels":
-                    # For labels, we pad with -100 so they're ignored in loss calculation
-                    batch[key] = torch.tensor([feature[key] for feature in features], dtype=torch.long)
-                else:
-                    # For other fields (input_ids, attention_mask), pad with pad_token_id
-                    batch[key] = torch.tensor([feature[key] for feature in features], dtype=torch.long)
-                    
-            return batch
             
     # Create a custom data collator
-    # data_collator = SimpleDataCollator(pad_token_id=tokenizer.pad_token_id)
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False  # Set to False for causal LM (not masked LM)
     )
     
+    model.train()
     trainer = Trainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
         train_dataset=tokenized_train,
-        eval_dataset=tokenized_train,  # Use training data for evaluation as well
     )
     
+    # Train model
+    print("Training model...")
+    trainer.train()
+
+    # Save model
+    print(f"Saving model to {output_dir}...")
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    # Final evaluation using MCQ format on the full training dataset
+    print("Performing final QA evaluation using MCQ format...")
+    model.eval()
     # Add custom QA evaluation callback
     qa_eval_callback = QAEvaluationCallback(
         trainer=trainer,
@@ -531,29 +421,7 @@ def main():
         tokenizer=tokenizer,
         args=args
     )
-    trainer.add_callback(qa_eval_callback)
-    
-    # Train model
-    print("Training model...")
-    trainer.train()
-    
-    # Save model
-    print(f"Saving model to {output_dir}...")
-    # For LoRA models, save differently
-    if args.lora:
-        model.save_pretrained(output_dir)
-    else:
-        trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    
-    # Final evaluation using MCQ format on the full training dataset
-    print("Performing final QA evaluation using MCQ format...")
-    model.eval()
-    
-    # Use the full dataset for final evaluation with more samples
-    args.eval_samples = min(500, len(train_dataset))  # Use more samples for final evaluation
-    # Keep using the same batch size for final evaluation
-    final_results = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset, args)
+    final_results = qa_eval_callback.evaluate_qa(model, tokenizer, eval_dataset, args)
     
     print("\n===== FINAL RESULTS (MCQ Format) =====")
     for question_type, accuracy in final_results.items():
