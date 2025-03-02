@@ -146,6 +146,9 @@ class QAEvaluationCallback(TrainerCallback):
         
         # Calculate accuracy for each QA type using batched processing
         device = model.device
+        total_correct = 0
+        total_samples = 0
+        
         for q_field, prompts_and_answers in qa_type_prompts.items():
             # Only debug the first question type to avoid too much output
             debug_this_type = args.debug and q_field == QA_FIELDS[0][0]
@@ -159,17 +162,13 @@ class QAEvaluationCallback(TrainerCallback):
                 debug=debug_this_type
             )
             results[q_field] = accuracy
+            
+            # Add to totals for overall accuracy
+            total_correct += accuracy * len(prompts_and_answers)
+            total_samples += len(prompts_and_answers)
         
-        # Calculate overall accuracy
-        overall_accuracy = score_answers(
-            model, 
-            tokenizer, 
-            overall_prompts, 
-            model.device, 
-            batch_size=args.eval_batch_size,
-            debug=False  # We already debugged one question type
-        )
-        results["overall"] = overall_accuracy
+        # Calculate overall accuracy from accumulated results
+        results["overall"] = total_correct / total_samples if total_samples > 0 else 0
         
         return results
 
