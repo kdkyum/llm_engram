@@ -510,7 +510,11 @@ def main():
             return batch
             
     # Create a custom data collator
-    data_collator = SimpleDataCollator(pad_token_id=tokenizer.pad_token_id)
+    # data_collator = SimpleDataCollator(pad_token_id=tokenizer.pad_token_id)
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # Set to False for causal LM (not masked LM)
+    )
     
     trainer = Trainer(
         model=model,
