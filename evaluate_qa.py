@@ -31,7 +31,7 @@ def parse_args():
 
 def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices=4):
     """Create a multiple-choice prompt with one correct and three incorrect answers."""
-    options = ["A", "B", "C", "D"]
+    options = [" A", " B", " C", " D"]
     
     # Find field type from question
     qa_field = None
@@ -86,22 +86,24 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
     for i in tqdm(range(0, len(prompts_and_answers), batch_size)):
         batch_prompts = [p[0] for p in prompts_and_answers[i:i+batch_size]]
         batch_answers = [p[1] for p in prompts_and_answers[i:i+batch_size]]
-        
-        # Debug: print a sample prompt
-        if debug and i == 0:
-            print("\n=== DEBUG: Sample QA prompt ===")
-            print(f"Prompt: {batch_prompts[0]}")
-            print(f"Correct answer: {batch_answers[0]}")
-            
-            # Show tokenization of the prompt
-            tokens = tokenizer.tokenize(batch_prompts[0])
-            token_ids = tokenizer.encode(batch_prompts[0])
-            print("\nTokenization:")
-            for idx, (token, token_id) in enumerate(zip(tokens, token_ids)):
-                print(f"Position {idx}: '{token}' (ID: {token_id})")
             
         # Tokenize all prompts in the batch
         batch_inputs = tokenizer(batch_prompts, padding=True, return_tensors="pt").to(device)
+
+        # Debug: print a sample prompt from batch_inputs
+        if debug and i == 0:
+            print("\n=== DEBUG: Sample QA prompt ===")
+            # Decode the first sequence from batch_inputs
+            sample_prompt = tokenizer.decode(batch_inputs['input_ids'][0])
+            print(f"Prompt: {sample_prompt}")
+            print(f"Correct answer: {batch_answers[0]}")
+            
+            # Show tokenization details
+            tokens = tokenizer.convert_ids_to_tokens(batch_inputs['input_ids'][0])
+            token_ids = batch_inputs['input_ids'][0].tolist()
+            print("\nTokenization:")
+            for idx, (token, token_id) in enumerate(zip(tokens, token_ids)):
+                print(f"Position {idx}: '{token}' (ID: {token_id})")
         
         # Get all logits for the batch
         with torch.no_grad():

@@ -13,6 +13,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer,
+    GPT2Tokenizer,
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
@@ -79,15 +80,6 @@ class QAEvaluationCallback(TrainerCallback):
             for question_type, accuracy in qa_results.items():
                 print(f"{question_type}: {accuracy:.4f}")
             print(f"Overall Accuracy: {qa_results['overall']:.4f}")
-            
-            # Create a table to show results by question type
-            qa_table = wandb.Table(columns=["Question Type", "Accuracy"])
-            for question_type, accuracy in qa_results.items():
-                if question_type != "overall":  # Skip overall since we show it separately
-                    question_name = question_type.replace("_q", "").capitalize()
-                    qa_table.add_data(question_name, accuracy)
-            
-            wandb.log({f"eval_{self.eval_steps}/results_table": qa_table}, step=state.global_step)
             
         except Exception as e:
             print(f"Error during evaluation: {e}")
@@ -240,7 +232,10 @@ def main():
     print(f"Loading {args.model_type} model: {args.model_name_or_path}...")
     
     # Load tokenizer 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    if args.model_type == "gpt2":
+        tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path, add_bos_token=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     
     # Ensure pad token is set
     if tokenizer.pad_token is None:
@@ -249,14 +244,20 @@ def main():
     # Load model with appropriate configuration
     if args.model_type in ["gpt-j", "gpt-neox", "llama"]:
         # For larger models, use additional configurations and BF16
-        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            device_map="auto",
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            use_cache=False  # Disable KV cache for compatibility with gradient checkpointing
-        )
+        torch_dtype = torch.float16 if args.bf16 else torch.float32
+
+        if "gpt" in args.model_type:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name_or_path,
+                device_map="auto",
+                torch_dtype=torch_dtype,
+            )
+        elif args.model_type == "llama":
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name_or_path,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
         
         # For LoRA, we need to import PEFT
         if args.lora:
@@ -393,7 +394,7 @@ def main():
     
     # Prepare a dataset class that will properly tokenize our data
     class BioDataset(torch.utils.data.Dataset):
-        def __init__(self, dataset, tokenizer, bio_field, max_length=512, debug=False):
+        def __init__(self, dataset, tokenizer, bio_field, max_length=256, debug=False):
             self.dataset = dataset
             self.tokenizer = tokenizer
             self.bio_field = bio_field
@@ -484,10 +485,6 @@ def main():
         evaluation_strategy="no",  # We'll do our own evaluation with the callback
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
         report_to="wandb",
-        # Add gradient checkpointing for memory efficiency with larger models
-        gradient_checkpointing=True,  # Enable for all models to save memory
-        # With gradient checkpointing enabled, make sure to use_cache=False
-        ddp_find_unused_parameters=False,  # Important to avoid issues with gradient checkpointing
         warmup_steps=args.warmup_steps,  # Add warmup steps
     )
     
