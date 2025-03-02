@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
     return parser.parse_args()
 
-def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices=4):
+def create_multiple_choice_prompt(question, correct_answer, dataset, tokenizer=None, num_choices=4):
     """Create a multiple-choice prompt with one correct and three incorrect answers."""
     options = ["A", "B", "C", "D"]
     
@@ -57,8 +57,14 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices
     correct_idx = random.randint(0, 3)
     choices.insert(correct_idx, correct_answer)
     
-    # Format the multiple-choice prompt
-    prompt = f"{question}\n"
+    # Format the multiple-choice prompt with a begin-of-text token if tokenizer is provided
+    if tokenizer and hasattr(tokenizer, "bos_token") and tokenizer.bos_token:
+        prompt = f"{tokenizer.bos_token}{question}\n"
+    else:
+        # Default to using <|begin_of_text|> as string if tokenizer not available
+        prompt = f"<|begin_of_text|>{question}\n"
+        
+    # Add the choices
     for i, (option, choice) in enumerate(zip(options, choices)):
         prompt += f"{option}. {choice}\n"
     prompt += "Answer: "
@@ -156,7 +162,7 @@ def evaluate_qa_by_type(model, tokenizer, test_dataset, args):
             correct_answer = test_dataset[i][a_field]
             
             prompt, correct_option = create_multiple_choice_prompt(
-                question, correct_answer, test_dataset
+                question, correct_answer, test_dataset, tokenizer
             )
             
             if prompt and correct_option:
