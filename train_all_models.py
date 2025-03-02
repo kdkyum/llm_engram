@@ -26,12 +26,17 @@ def main():
     # Define models to train
     models = [
         # GPT-2 models
-        {"name": "gpt2", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        {"name": "gpt2-medium", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        {"name": "gpt2-large", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        {"name": "gpt2-xl", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
+        # {"name": "gpt2", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
+        # {"name": "gpt2-medium", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
+        # {"name": "gpt2-large", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
+        # {"name": "gpt2-xl", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
         {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "eval_batch_size": 1},
         {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
+        #meta-llama/Llama-2-13b-hf
+        # {"name": "meta-llama/Llama-2-13B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
+        #meta-llama/Llama-2-70b-hf
+        # {"name": "meta-llama/Llama-2-70B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True}
     ]
     
     # Define learning rates for hyperparameter sweep if enabled
@@ -73,6 +78,7 @@ def main():
             fp16 = model_info.get("fp16", False)
             gradient_checkpointing = model_info.get("gradient_checkpointing", False)
             eval_batch_size = model_info.get("eval_batch_size", 16)
+            load_in_8bit = model_info.get("load_in_8bit", False)
             
             # Get short name for directories
             model_short_name = model_name.split("/")[-1] if "/" in model_name else model_name
@@ -118,6 +124,9 @@ def main():
                 
                 if args.gradient_checkpointing or gradient_checkpointing:
                     cmd.append("--gradient_checkpointing")
+
+                if load_in_8bit:
+                    cmd.append("--load_in_8bit")
                 
                 # Run training
                 try:
