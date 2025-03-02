@@ -61,8 +61,8 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices
         
     # Add the choices
     for i, (option, choice) in enumerate(zip(options, choices)):
-        prompt += f"{option}. {choice}\n"
-    prompt += "Answer: "
+        prompt += f" {option}. {choice}\n"
+    prompt += "Answer:"
     
     return prompt, options[correct_idx]
 
@@ -72,7 +72,7 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
         return 0
     
     correct = 0
-    options = ["A", "B", "C", "D"]
+    options = [" A", " B", " C", " D"]
     option_tokens = {opt: tokenizer(opt, add_special_tokens=False).input_ids[0] for opt in options}
     
     # Print option tokens for debugging
