@@ -389,28 +389,6 @@ class BioDataset(torch.utils.data.Dataset):
         # Create labels for causal LM (same as input_ids)
         inputs["labels"] = input_ids.copy()
         
-        # Debug: print tokenization details for the first example
-        if self.debug and idx == 0:
-            print("\n=== DEBUG: Example Tokenization ===")
-            print(f"Original text: {text[:100]}...")  # Show beginning of text
-            print(f"Input IDs: {input_ids[:50]}...")  # Show first 50 tokens
-            
-            # Print actual tokens
-            tokens = self.tokenizer.convert_ids_to_tokens(input_ids[:50])
-            print("\nFirst 50 tokens:")
-            for i, (token, token_id) in enumerate(zip(tokens, input_ids[:50])):
-                print(f"Position {i}: '{token}' (ID: {token_id})")
-            
-            # Show attention mask
-            print(f"\nAttention Mask (first 50): {attention_mask[:50]}")
-            
-            # Show where padding starts
-            if 0 in attention_mask:
-                pad_pos = attention_mask.index(0)
-                print(f"Padding starts at position {pad_pos}")
-            else:
-                print("No padding in this example")
-        
         return inputs
     
 
@@ -488,6 +466,31 @@ def main():
     print("Loading dataset...")
     dataset = load_dataset("minsungkim/bioS_v1")
     train_dataset = dataset["train"]
+    
+    # Import early to check for precomputed answers
+    from evaluate_qa import create_multiple_choice_prompt, precomputed_answers
+    
+    # If precomputed answers are not available, compute them now
+    if not precomputed_answers:
+        print("Precomputed answers not found. Run precompute_answer_categories.py first for better performance.")
+        print("Collecting unique answers from dataset (this might take a while)...")
+        
+        all_answers_by_field = {}
+        for _, a_field in QA_FIELDS:
+            # Get unique answers for this field
+            unique_answers = set()
+            for i in range(len(train_dataset)):
+                answer = train_dataset[i][a_field]
+                unique_answers.add(answer)
+            
+            # Store as list
+            all_answers_by_field[a_field] = list(unique_answers)
+            print(f"Collected {len(unique_answers)} unique answers for {a_field}")
+        
+        # Make this available for MCQ generation
+        create_multiple_choice_prompt.all_answers_by_field = all_answers_by_field
+    else:
+        print("Using precomputed answer categories")
     
     # Limit dataset size if max_samples is specified
     if args.max_samples is not None:

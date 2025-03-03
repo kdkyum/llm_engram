@@ -2,6 +2,8 @@ import argparse
 import random
 import numpy as np
 import torch
+import json
+import os
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
@@ -14,6 +16,24 @@ QA_FIELDS = [
     ("employer_q", "employer_a"),
     ("company_city_q", "company_city_a")
 ]
+
+# Path to precomputed unique answers
+UNIQUE_ANSWERS_FILE = "unique_answers.json"
+
+# Load precomputed unique answers if available
+def load_unique_answers():
+    if os.path.exists(UNIQUE_ANSWERS_FILE):
+        try:
+            with open(UNIQUE_ANSWERS_FILE, 'r') as f:
+                unique_answers = json.load(f)
+            print(f"Loaded precomputed unique answers from {UNIQUE_ANSWERS_FILE}")
+            return unique_answers
+        except Exception as e:
+            print(f"Error loading unique answers: {e}")
+    return None
+
+# Global variable to store precomputed answers
+precomputed_answers = load_unique_answers()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate fine-tuned language models on QA tasks")
@@ -57,33 +77,67 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices
         print(f"Could not identify question type for: {question}")
         return None, None
     
-    # Get incorrect answers from the dataset in a different way if shuffling
-    if shuffle_choices:
-        # Use a seed based on question text to ensure different but consistent shuffling patterns
-        # This provides a different pattern than used in training, but consistent across evaluations
-        question_hash = hash(question) % 10000
-        local_random = random.Random(question_hash)
+    # Check for precomputed answers first (fastest)
+    if precomputed_answers and qa_field in precomputed_answers:
+        all_field_answers = precomputed_answers[qa_field]
         
-        # Sample more potential incorrect answers to increase variety
-        potential_incorrect = []
-        for _ in range(10):  # Try to get 10 potential answers
-            random_idx = local_random.randint(0, len(dataset) - 1)
-            random_answer = dataset[random_idx][qa_field]
-            if random_answer != correct_answer and random_answer not in potential_incorrect:
-                potential_incorrect.append(random_answer)
+        # Filter out the correct answer
+        available_options = [a for a in all_field_answers if a != correct_answer]
         
-        # Shuffle and take first 3
-        local_random.shuffle(potential_incorrect)
-        incorrect_answers = potential_incorrect[:3]
+        if shuffle_choices:
+            # Use a seed based on question for consistent but different patterns
+            question_hash = hash(question) % 10000
+            local_random = random.Random(question_hash)
+            local_random.shuffle(available_options)
+        else:
+            # Just shuffle once to get random incorrect answers
+            random.shuffle(available_options)
         
-        # If we didn't get enough, fall back to regular sampling
-        while len(incorrect_answers) < 3:
-            random_idx = local_random.randint(0, len(dataset) - 1)
-            random_answer = dataset[random_idx][qa_field]
-            if random_answer != correct_answer and random_answer not in incorrect_answers:
-                incorrect_answers.append(random_answer)
+        # Take first 3 as incorrect answers
+        incorrect_answers = available_options[:3]
+        
+        # If we somehow don't have enough options, fall back to old method
+        if len(incorrect_answers) < 3:
+            print(f"Warning: Not enough unique answers for {qa_field}, using fallback method")
+            # Fallback to original implementation
+            incorrect_answers = []
+            while len(incorrect_answers) < 3:
+                random_idx = random.randint(0, len(dataset) - 1)
+                random_answer = dataset[random_idx][qa_field]
+                if random_answer != correct_answer and random_answer not in incorrect_answers:
+                    incorrect_answers.append(random_answer)
+    # Fallback to dynamically collected answers if available
+    elif hasattr(create_multiple_choice_prompt, 'all_answers_by_field') and qa_field in create_multiple_choice_prompt.all_answers_by_field:
+        # Get list of all possible answers for this field
+        all_field_answers = create_multiple_choice_prompt.all_answers_by_field[qa_field]
+        
+        # Filter out the correct answer
+        available_options = [a for a in all_field_answers if a != correct_answer]
+        
+        if shuffle_choices:
+            # Use a seed based on question for consistent but different patterns
+            question_hash = hash(question) % 10000
+            local_random = random.Random(question_hash)
+            local_random.shuffle(available_options)
+        else:
+            # Just shuffle once to get random incorrect answers
+            random.shuffle(available_options)
+        
+        # Take first 3 as incorrect answers
+        incorrect_answers = available_options[:3]
+        
+        # If we somehow don't have enough options, fall back to old method
+        if len(incorrect_answers) < 3:
+            print(f"Warning: Not enough unique answers for {qa_field}, using fallback method")
+            # Fallback to original implementation
+            incorrect_answers = []
+            while len(incorrect_answers) < 3:
+                random_idx = random.randint(0, len(dataset) - 1)
+                random_answer = dataset[random_idx][qa_field]
+                if random_answer != correct_answer and random_answer not in incorrect_answers:
+                    incorrect_answers.append(random_answer)
     else:
-        # Original implementation - get 3 random incorrect answers
+        # Fallback to original implementation - get 3 random incorrect answers
         incorrect_answers = []
         while len(incorrect_answers) < 3:
             random_idx = random.randint(0, len(dataset) - 1)
@@ -254,6 +308,23 @@ def main():
     print("Loading dataset...")
     dataset = load_dataset("minsungkim/bioS_v1")
     test_dataset = dataset["train"]  # Since there's only a train split, we'll sample from it
+    
+    # Collect all possible answers by category/field for proper MCQ generation
+    print("Collecting all possible answers by category...")
+    all_answers_by_field = {}
+    for _, a_field in QA_FIELDS:
+        # Get unique answers for this field
+        unique_answers = set()
+        for i in range(len(test_dataset)):
+            answer = test_dataset[i][a_field]
+            unique_answers.add(answer)
+        
+        # Store as list
+        all_answers_by_field[a_field] = list(unique_answers)
+        print(f"Collected {len(unique_answers)} unique answers for {a_field}")
+    
+    # Make this available for MCQ generation
+    create_multiple_choice_prompt.all_answers_by_field = all_answers_by_field
     
     # Load the model and tokenizer based on model type
     print(f"Loading model from {args.model_path}...")
