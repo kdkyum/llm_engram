@@ -29,8 +29,21 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
     return parser.parse_args()
 
-def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices=4):
-    """Create a multiple-choice prompt with one correct and three incorrect answers."""
+def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices=4, shuffle_choices=False):
+    """Create a multiple-choice prompt with one correct and three incorrect answers.
+    
+    Args:
+        question: The question text
+        correct_answer: The correct answer
+        dataset: The dataset to sample other answers from
+        num_choices: Number of choices to include (default 4)
+        shuffle_choices: Whether to shuffle the incorrect choices to create 
+                         different patterns (used for evaluation to test for overfitting)
+    
+    Returns:
+        prompt: The formatted prompt with question and choices
+        correct_option: The option letter (e.g., " A") corresponding to the correct answer
+    """
     options = [" A", " B", " C", " D"]
     
     # Find field type from question
@@ -44,13 +57,39 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices
         print(f"Could not identify question type for: {question}")
         return None, None
     
-    # Get 3 random incorrect answers from the dataset
-    incorrect_answers = []
-    while len(incorrect_answers) < 3:
-        random_idx = random.randint(0, len(dataset) - 1)
-        random_answer = dataset[random_idx][qa_field]
-        if random_answer != correct_answer and random_answer not in incorrect_answers:
-            incorrect_answers.append(random_answer)
+    # Get incorrect answers from the dataset in a different way if shuffling
+    if shuffle_choices:
+        # Use a seed based on question text to ensure different but consistent shuffling patterns
+        # This provides a different pattern than used in training, but consistent across evaluations
+        question_hash = hash(question) % 10000
+        local_random = random.Random(question_hash)
+        
+        # Sample more potential incorrect answers to increase variety
+        potential_incorrect = []
+        for _ in range(10):  # Try to get 10 potential answers
+            random_idx = local_random.randint(0, len(dataset) - 1)
+            random_answer = dataset[random_idx][qa_field]
+            if random_answer != correct_answer and random_answer not in potential_incorrect:
+                potential_incorrect.append(random_answer)
+        
+        # Shuffle and take first 3
+        local_random.shuffle(potential_incorrect)
+        incorrect_answers = potential_incorrect[:3]
+        
+        # If we didn't get enough, fall back to regular sampling
+        while len(incorrect_answers) < 3:
+            random_idx = local_random.randint(0, len(dataset) - 1)
+            random_answer = dataset[random_idx][qa_field]
+            if random_answer != correct_answer and random_answer not in incorrect_answers:
+                incorrect_answers.append(random_answer)
+    else:
+        # Original implementation - get 3 random incorrect answers
+        incorrect_answers = []
+        while len(incorrect_answers) < 3:
+            random_idx = random.randint(0, len(dataset) - 1)
+            random_answer = dataset[random_idx][qa_field]
+            if random_answer != correct_answer and random_answer not in incorrect_answers:
+                incorrect_answers.append(random_answer)
     
     # Create choices list with the correct answer at a random position
     choices = incorrect_answers.copy()

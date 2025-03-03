@@ -15,6 +15,9 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
     parser.add_argument("--base_output_dir", type=str, default="./model-output", help="Base directory to save models")
+    parser.add_argument("--mcq_percentage", type=int, default=0, help="Percentage of MCQ evaluation examples to include in training data (0-100)")
+    parser.add_argument("--mcq_with_bios", action="store_true", help="Include bioS text with MCQ examples (if not set, only MCQ text is used)")
+    parser.add_argument("--shuffle_eval_choices", action="store_true", help="Shuffle MCQ choices during evaluation to test for overfitting")
     return parser.parse_args()
 
 def main():
@@ -26,17 +29,17 @@ def main():
     # Define models to train
     models = [
         # GPT-2 models
-        # {"name": "gpt2", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        # {"name": "gpt2-medium", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        # {"name": "gpt2-large", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        # {"name": "gpt2-xl", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 4},
-        {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "eval_batch_size": 1},
-        {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
+        {"name": "gpt2", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
+        {"name": "gpt2-medium", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
+        {"name": "gpt2-large", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
+        {"name": "gpt2-xl", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
+        # {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
         #meta-llama/Llama-2-13b-hf
-        # {"name": "meta-llama/Llama-2-13B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
+        # {"name": "meta-llama/Llama-2-13b-hf", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
         #meta-llama/Llama-2-70b-hf
-        # {"name": "meta-llama/Llama-2-70B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True}
+        # {"name": "meta-llama/Llama-2-70b-hf", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True}
     ]
     
     # Define learning rates for hyperparameter sweep if enabled
@@ -116,7 +119,8 @@ def main():
                     "--bio_field", bio_field,  # Use current bio field
                     "--output_dir", output_dir,
                     "--wandb_run_name", f"{model_short_name}-{bio_field}-lr{lr_str}",
-                    "--freeze_embeddings"
+                    "--freeze_embeddings",
+                    "--mcq_percentage", str(args.mcq_percentage)
                 ]
                 
                 if args.fp16 or fp16:
@@ -127,6 +131,12 @@ def main():
 
                 if load_in_8bit:
                     cmd.append("--load_in_8bit")
+                
+                if args.mcq_with_bios:
+                    cmd.append("--mcq_with_bios")
+                
+                if args.shuffle_eval_choices:
+                    cmd.append("--shuffle_eval_choices")
                 
                 # Run training
                 try:
