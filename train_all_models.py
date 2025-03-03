@@ -24,7 +24,7 @@ def main():
     args = parse_args()
 
     # Define all possible bio fields
-    bio_fields = ["bioS", "bioS_fullname", "bioS_multi5_permutes"]
+    bio_fields = ["bioS"] #, "bioS_fullname", "bioS_multi5_permutes"]
     
     # Define models to train
     models = [
@@ -65,7 +65,7 @@ def main():
     results = {}
     
     # Train each model with each bio field
-    for model_info in models[::-1]:
+    for model_info in models:
         model_name = model_info["name"]
         model_results = {}
         

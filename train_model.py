@@ -844,11 +844,11 @@ def main():
     question_types = [qtype.replace("_q", "").capitalize() for qtype in final_results.keys() 
                     if qtype != "overall" and not qtype.startswith("mcq_")]
     
-    # Create a bar chart
+    # Create a bar chart - simpler approach
     data = [[label, val] for label, val in zip(question_types, accuracies)]
     table = wandb.Table(data=data, columns=["Question Type", "Accuracy"])
-    wandb.log({"accuracy_by_question_type": wandb.plot.bar(
-        table, "Question Type", "Accuracy", title="Final Accuracy by Question Type")})
+    # Log the table directly, W&B will create a visualization
+    wandb.log({"accuracy_by_question_type": table})
     
     # Create a comparison chart for MCQ trained vs untrained if available
     if mcq_indices and args.mcq_percentage > 0:
@@ -865,11 +865,10 @@ def main():
         mcq_data.append(["Overall", "Trained", final_results["mcq_trained_overall"]])
         mcq_data.append(["Overall", "Untrained", final_results["mcq_untrained_overall"]])
         
-        # Create table and chart
+        # Create table and chart - simpler approach
         mcq_table = wandb.Table(data=mcq_data, columns=["Question Type", "Training", "Accuracy"])
-        wandb.log({"mcq_comparison": wandb.plot.bar(
-            mcq_table, "Question Type", "Accuracy", "Training",
-            title="MCQ Trained vs Untrained Accuracy")})
+        # Log the table directly, W&B will create a visualization
+        wandb.log({"mcq_comparison": mcq_table})
     
     # Create an overfitting analysis chart if available
     if shuffled_results:
@@ -883,11 +882,10 @@ def main():
         overfitting_data.append(["Overall", "Original Order", final_results["overall"]])
         overfitting_data.append(["Overall", "Shuffled Order", shuffled_results["overall"]])
         
-        # Create table and chart
+        # Create table and chart - simpler approach
         overfitting_table = wandb.Table(data=overfitting_data, columns=["Question Type", "Evaluation", "Accuracy"])
-        wandb.log({"overfitting_analysis": wandb.plot.bar(
-            overfitting_table, "Question Type", "Accuracy", "Evaluation",
-            title="MCQ Ordering Effect (Overfitting Analysis)")})
+        # Log the table directly, W&B will create a visualization
+        wandb.log({"overfitting_analysis": overfitting_table})
         
         # Create a table specifically for the difference (for easier visualization)
         diff_data = []
@@ -900,11 +898,10 @@ def main():
         overall_diff = final_results["overall"] - shuffled_results["overall"]
         diff_data.append(["Overall", overall_diff])
         
-        # Create table and chart
+        # Create table and chart - simpler approach
         diff_table = wandb.Table(data=diff_data, columns=["Question Type", "Accuracy Drop"])
-        wandb.log({"overfitting_difference": wandb.plot.bar(
-            diff_table, "Question Type", "Accuracy Drop",
-            title="Accuracy Drop with Shuffled MCQ Choices (Higher = More Overfitting)")})
+        # Log the table directly, W&B will create a visualization
+        wandb.log({"overfitting_difference": diff_table})
     
     # Finish wandb run
     wandb.finish()
