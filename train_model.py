@@ -848,7 +848,10 @@ def main():
     data = [[label, val] for label, val in zip(question_types, accuracies)]
     table = wandb.Table(data=data, columns=["Question Type", "Accuracy"])
     wandb.log({"accuracy_by_question_type": wandb.plot.bar(
-        table, "Question Type", "Accuracy", title="Final Accuracy by Question Type")})
+        table=table, 
+        x="Question Type", 
+        y="Accuracy", 
+        title="Final Accuracy by Question Type")})
     
     # Create a comparison chart for MCQ trained vs untrained if available
     if mcq_indices and args.mcq_percentage > 0:
@@ -868,7 +871,10 @@ def main():
         # Create table and chart
         mcq_table = wandb.Table(data=mcq_data, columns=["Question Type", "Training", "Accuracy"])
         wandb.log({"mcq_comparison": wandb.plot.bar(
-            mcq_table, "Question Type", "Accuracy", "Training",
+            table=mcq_table, 
+            x="Question Type", 
+            y="Accuracy", 
+            groupby="Training",
             title="MCQ Trained vs Untrained Accuracy")})
     
     # Create an overfitting analysis chart if available
@@ -886,7 +892,10 @@ def main():
         # Create table and chart
         overfitting_table = wandb.Table(data=overfitting_data, columns=["Question Type", "Evaluation", "Accuracy"])
         wandb.log({"overfitting_analysis": wandb.plot.bar(
-            overfitting_table, "Question Type", "Accuracy", "Evaluation",
+            table=overfitting_table,
+            x="Question Type", 
+            y="Accuracy", 
+            groupby="Evaluation",
             title="MCQ Ordering Effect (Overfitting Analysis)")})
         
         # Create a table specifically for the difference (for easier visualization)
@@ -903,7 +912,9 @@ def main():
         # Create table and chart
         diff_table = wandb.Table(data=diff_data, columns=["Question Type", "Accuracy Drop"])
         wandb.log({"overfitting_difference": wandb.plot.bar(
-            diff_table, "Question Type", "Accuracy Drop", 
+            table=diff_table, 
+            x="Question Type", 
+            y="Accuracy Drop",
             title="Accuracy Drop with Shuffled MCQ Choices (Higher = More Overfitting)")})
     
     # Finish wandb run
