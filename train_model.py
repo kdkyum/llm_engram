@@ -10,6 +10,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer,
+    GPT2LMHeadModel,
     GPT2Tokenizer,
     TrainingArguments,
     Trainer,
@@ -29,14 +30,12 @@ from transformers import TrainerCallback
 class QAEvaluationCallback(TrainerCallback):
     """Custom callback for QA evaluation during training"""
     
-    def __init__(self, trainer, eval_dataset, tokenizer, args, mcq_indices=None):
+    def __init__(self, trainer, eval_dataset, tokenizer, args):
         self.trainer = trainer
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
         self.args = args
         self.eval_steps = 0
-        # Store the set of indices that were used for MCQ training
-        self.mcq_indices = mcq_indices or set()
 
     def on_epoch_end(self, args, state, control, **kwargs):
         """Run evaluation at the end of each epoch"""
@@ -76,39 +75,12 @@ class QAEvaluationCallback(TrainerCallback):
                 "eval/qa_company_city_accuracy": qa_results["company_city_q"],
             }, step=state.global_step)
             
-            # If we have MCQ indices (trained with MCQ examples), log separate metrics
-            if self.mcq_indices and self.args.mcq_percentage > 0:
-                # Log separate metrics for trained and untrained samples
-                wandb.log({
-                    "eval/mcq_trained_overall_accuracy": qa_results["mcq_trained_overall"],
-                    "eval/mcq_untrained_overall_accuracy": qa_results["mcq_untrained_overall"],
-                    # Add per-question type metrics
-                    "eval/mcq_trained_bdate_accuracy": qa_results["mcq_trained_bdate_q"],
-                    "eval/mcq_trained_bcity_accuracy": qa_results["mcq_trained_bcity_q"],
-                    "eval/mcq_trained_university_accuracy": qa_results["mcq_trained_university_q"],
-                    "eval/mcq_trained_major_accuracy": qa_results["mcq_trained_major_q"],
-                    "eval/mcq_trained_employer_accuracy": qa_results["mcq_trained_employer_q"],
-                    "eval/mcq_trained_company_city_accuracy": qa_results["mcq_trained_company_city_q"],
-                    "eval/mcq_untrained_bdate_accuracy": qa_results["mcq_untrained_bdate_q"],
-                    "eval/mcq_untrained_bcity_accuracy": qa_results["mcq_untrained_bcity_q"],
-                    "eval/mcq_untrained_university_accuracy": qa_results["mcq_untrained_university_q"],
-                    "eval/mcq_untrained_major_accuracy": qa_results["mcq_untrained_major_q"],
-                    "eval/mcq_untrained_employer_accuracy": qa_results["mcq_untrained_employer_q"],
-                    "eval/mcq_untrained_company_city_accuracy": qa_results["mcq_untrained_company_city_q"],
-                }, step=state.global_step)
             
             print(f"\n===== QA EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
             for question_type, accuracy in qa_results.items():
                 if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics in the print output
                     print(f"{question_type}: {accuracy:.4f}")
             print(f"Overall Accuracy: {qa_results['overall']:.4f}")
-            
-            # Print MCQ comparison if available
-            if self.mcq_indices and self.args.mcq_percentage > 0:
-                print(f"\n----- MCQ Training Comparison -----")
-                print(f"Samples trained with MCQ: {qa_results['mcq_trained_overall']:.4f}")
-                print(f"Samples not trained with MCQ: {qa_results['mcq_untrained_overall']:.4f}")
-                print(f"Difference: {qa_results['mcq_trained_overall'] - qa_results['mcq_untrained_overall']:.4f}")
             
         except Exception as e:
             print(f"Error during evaluation: {e}")
@@ -136,10 +108,6 @@ class QAEvaluationCallback(TrainerCallback):
         # Collect prompts and answers for each QA type
         qa_type_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
         
-        # If we have MCQ training examples, also collect separate prompts for trained vs untrained
-        mcq_trained_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
-        mcq_untrained_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
-        
         # First collect all prompts and answers
         for i in indices:
             for q_field, a_field in QA_FIELDS:
@@ -147,21 +115,13 @@ class QAEvaluationCallback(TrainerCallback):
                 correct_answer = eval_dataset[i][a_field]
                 
                 prompt, correct_option = create_multiple_choice_prompt(
-                    question, correct_answer, eval_dataset, 
-                    shuffle_choices=args.shuffle_eval_choices
+                    question, correct_answer, eval_dataset, a_field, with_fewshot=True
                 )
                 
                 if prompt and correct_option:
                     qa_type_prompts[q_field].append((prompt, correct_option))
                     # Also add to overall prompts for combined score
                     overall_prompts.append((prompt, correct_option))
-                    
-                    # Sort into trained vs. untrained prompts if we're using MCQ
-                    if self.mcq_indices and args.mcq_percentage > 0:
-                        if i in self.mcq_indices:
-                            mcq_trained_prompts[q_field].append((prompt, correct_option))
-                        else:
-                            mcq_untrained_prompts[q_field].append((prompt, correct_option))
                     
                     # Debug: Print one example of each question type
                     if args.debug and len(qa_type_prompts[q_field]) == 1:
@@ -176,11 +136,6 @@ class QAEvaluationCallback(TrainerCallback):
             print("\n=== DEBUG: Number of examples per question type ===")
             for q_field, prompts in qa_type_prompts.items():
                 print(f"{q_field}: {len(prompts)} examples")
-            
-            if self.mcq_indices and args.mcq_percentage > 0:
-                print("\n=== DEBUG: MCQ Trained vs Untrained counts ===")
-                for q_field in qa_type_prompts.keys():
-                    print(f"{q_field} - Trained: {len(mcq_trained_prompts[q_field])}, Untrained: {len(mcq_untrained_prompts[q_field])}")
         
         # Calculate accuracy for each QA type using batched processing
         device = model.device
@@ -207,56 +162,6 @@ class QAEvaluationCallback(TrainerCallback):
         
         # Calculate overall accuracy from accumulated results
         results["overall"] = total_correct / total_samples if total_samples > 0 else 0
-        
-        # If we're using MCQ training, calculate separate metrics for trained vs untrained
-        if self.mcq_indices and args.mcq_percentage > 0:
-            # Calculate metrics for trained examples
-            mcq_trained_total_correct = 0
-            mcq_trained_total_samples = 0
-            
-            for q_field, prompts_and_answers in mcq_trained_prompts.items():
-                if prompts_and_answers:  # Skip if no examples
-                    accuracy = score_answers(
-                        model, 
-                        tokenizer, 
-                        prompts_and_answers, 
-                        device, 
-                        batch_size=args.eval_batch_size,
-                        debug=False
-                    )
-                    results[f"mcq_trained_{q_field}"] = accuracy
-                    
-                    # Add to totals for overall accuracy
-                    mcq_trained_total_correct += accuracy * len(prompts_and_answers)
-                    mcq_trained_total_samples += len(prompts_and_answers)
-                else:
-                    results[f"mcq_trained_{q_field}"] = 0.0
-            
-            # Calculate metrics for untrained examples
-            mcq_untrained_total_correct = 0
-            mcq_untrained_total_samples = 0
-            
-            for q_field, prompts_and_answers in mcq_untrained_prompts.items():
-                if prompts_and_answers:  # Skip if no examples
-                    accuracy = score_answers(
-                        model, 
-                        tokenizer, 
-                        prompts_and_answers, 
-                        device, 
-                        batch_size=args.eval_batch_size,
-                        debug=False
-                    )
-                    results[f"mcq_untrained_{q_field}"] = accuracy
-                    
-                    # Add to totals for overall accuracy
-                    mcq_untrained_total_correct += accuracy * len(prompts_and_answers)
-                    mcq_untrained_total_samples += len(prompts_and_answers)
-                else:
-                    results[f"mcq_untrained_{q_field}"] = 0.0
-            
-            # Calculate overall accuracy for trained and untrained
-            results["mcq_trained_overall"] = mcq_trained_total_correct / mcq_trained_total_samples if mcq_trained_total_samples > 0 else 0
-            results["mcq_untrained_overall"] = mcq_untrained_total_correct / mcq_untrained_total_samples if mcq_untrained_total_samples > 0 else 0
         
         return results
 
@@ -303,7 +208,6 @@ class BioDataset(torch.utils.data.Dataset):
             print(f"Selecting {num_samples_to_select} bioS samples to extract MCQ examples from")
             
             # Get indices of samples to use for MCQ
-            import random
             indices = list(range(num_bio_samples))
             random.shuffle(indices)
             selected_indices = indices[:num_samples_to_select]
@@ -323,13 +227,12 @@ class BioDataset(torch.utils.data.Dataset):
                     
                     # Always use fixed order for training examples
                     prompt, correct_option = create_multiple_choice_prompt(
-                        question, correct_answer, dataset,
-                        shuffle_choices=False  # Use consistent order during training
+                        question, correct_answer, dataset, a_field, with_fewshot=False
                     )
                     
                     if prompt and correct_option:
                         # Add MCQ example with full answer (not just the option)
-                        mcq_text = prompt + correct_option
+                        mcq_text = prompt + correct_option + ". " + correct_answer
                         
                         # If we want to include the bio text with the MCQ
                         if mcq_with_bios:
@@ -415,7 +318,6 @@ def parse_args():
     parser.add_argument("--freeze_embeddings", action="store_true", help="Freeze model embeddings")
     parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
-    parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps for learning rate scheduler")
     parser.add_argument("--load_in_8bit", action="store_true", help="Enable 8-bit quantization for large models")
     parser.add_argument("--mcq_percentage", type=int, default=0, help="Percentage of MCQ evaluation examples to include in training data (0-100)")
     parser.add_argument("--mcq_with_bios", action="store_true", help="Include bioS text with MCQ examples (if not set, only MCQ text is used)")
@@ -497,10 +399,6 @@ def main():
         print(f"Using first {args.max_samples} samples from dataset")
         train_dataset = train_dataset.select(range(min(args.max_samples, len(train_dataset))))
     
-    # Use full training dataset for both training and evaluation (no split)
-    # since all data is synthetic
-    eval_dataset = train_dataset
-    
     # Load tokenizer and model based on model type
     print(f"Loading {args.model_type} model: {args.model_name_or_path}...")
     
@@ -528,14 +426,17 @@ def main():
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
     
     # Load model with appropriate configuration
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, 
-        device_map="auto",
-        use_cache=False,
-        quantization_config=quantization_config,
-        # Change dtype based on model type and fp16 flag (only if not using quantization)
-        torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"] and not args.load_in_8bit else torch.float32
-    )
+    if args.model_type == "gpt2":
+        model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path, 
+            device_map="auto",
+            use_cache=False,
+            quantization_config=quantization_config,
+            # Change dtype based on model type and fp16 flag (only if not using quantization)
+            torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"] and not args.load_in_8bit else torch.float32
+        )
     
     # For quantized models, we need to use LoRA
     if args.load_in_8bit:
@@ -663,6 +564,14 @@ def main():
         mcq_with_bios=args.mcq_with_bios,
         debug=args.debug
     )
+
+    # Calculate total training steps considering multiple devices
+    n_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    print("n_devices:", n_devices)
+    effective_batch_size = args.per_device_train_batch_size * n_devices * args.gradient_accumulation_steps
+    total_steps = (len(tokenized_train) // effective_batch_size) * args.num_train_epochs
+    warmup_steps = int(total_steps * 0.05)
+    print(f"Total training steps: {total_steps}, Warmup steps (5%): {warmup_steps}")
     
     # Configure training with updated mixed precision settings
     training_args = TrainingArguments(
@@ -677,9 +586,7 @@ def main():
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
         report_to="wandb",
         gradient_checkpointing=args.gradient_checkpointing,
-        warmup_steps=args.warmup_steps,
-        lr_scheduler_type="constant",  # Use constant learning rate
-        # Update mixed precision settings
+        warmup_steps=warmup_steps,
         fp16=args.fp16 and args.model_type == "gpt2" and not args.load_in_8bit,  # Use fp16 only for gpt2
         bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"] and not args.load_in_8bit,  # Use bf16 for llama, gpt-j, and gpt-neox
         half_precision_backend="auto"
@@ -701,16 +608,7 @@ def main():
     
     # Get MCQ indices for evaluation comparison from the dataset
     mcq_indices = tokenized_train.mcq_indices if hasattr(tokenized_train, 'mcq_indices') else set()
-    
-    # Initialize the QA evaluation callback
-    qa_eval_callback = QAEvaluationCallback(
-        trainer=trainer,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        args=args,
-        mcq_indices=mcq_indices
-    )
-    
+   
     # Register the callback
     if args.mcq_percentage > 0:
         print(f"Adding evaluation callback with MCQ comparison (tracked {len(mcq_indices)} samples with MCQ training)")
@@ -730,182 +628,58 @@ def main():
     
     # First evaluate with original choice order (same as used in training)
     original_args = copy.deepcopy(args)
-    original_args.shuffle_eval_choices = False
-    final_results = qa_eval_callback.evaluate_qa(model, tokenizer, eval_dataset, original_args)
+
+    # Initialize the QA evaluation callback
+    qa_eval_callback = QAEvaluationCallback(
+        trainer=trainer,
+        eval_dataset=train_dataset,
+        tokenizer=tokenizer,
+        args=args,
+    )
     
-    # If shuffle_eval_choices is enabled, also evaluate with shuffled choices to check for overfitting
-    shuffled_results = None
-    if args.shuffle_eval_choices:
-        print("\nPerforming additional evaluation with shuffled MCQ choices to check for overfitting...")
-        shuffle_args = copy.deepcopy(args)
-        shuffle_args.shuffle_eval_choices = True
-        shuffled_results = qa_eval_callback.evaluate_qa(model, tokenizer, eval_dataset, shuffle_args)
-    
-    print("\n===== FINAL RESULTS (MCQ Format) =====")
-    for question_type, accuracy in final_results.items():
-        if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics in the main output
-            print(f"{question_type}: {accuracy:.4f}")
-    
-    # Print comparison with shuffled results if available
-    if shuffled_results:
-        print("\n===== EVALUATION WITH SHUFFLED MCQ CHOICES =====")
-        for question_type, accuracy in shuffled_results.items():
-            if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics
-                original_acc = final_results[question_type]
-                diff = original_acc - accuracy
-                print(f"{question_type}: {accuracy:.4f} (Original: {original_acc:.4f}, Diff: {diff:.4f})")
+    if mcq_indices:
+        # Split train_dataset into two subsets: one with indices in mcq_indices and one with the rest
+        train_dataset_in = train_dataset.select(list(mcq_indices))
+        all_indices = set(range(len(train_dataset)))
+        non_mcq_indices = list(all_indices - mcq_indices)
+        train_dataset_out = train_dataset.select(non_mcq_indices)
         
-        # Print overall difference to analyze overfitting
-        overall_diff = final_results["overall"] - shuffled_results["overall"]
-        print(f"\nOverall Original vs Shuffled Difference: {overall_diff:.4f}")
-        print(f"Possible overfitting to MCQ pattern: {'High' if overall_diff > 0.1 else 'Low'}")
-    
-    print(f"\nFinal Overall Accuracy: {final_results['overall']:.4f}")
-    
-    # Print MCQ comparison if available
-    if mcq_indices and args.mcq_percentage > 0:
-        print(f"\n===== MCQ TRAINING COMPARISON =====")
-        print(f"Samples trained with MCQ: {final_results['mcq_trained_overall']:.4f}")
-        print(f"Samples not trained with MCQ: {final_results['mcq_untrained_overall']:.4f}")
-        print(f"Improvement: {final_results['mcq_trained_overall'] - final_results['mcq_untrained_overall']:.4f}")
+        print("Evaluating on MCQ indices subset...")
+        final_results_in = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset_in, original_args)
+        print("Evaluating on non-MCQ indices subset...")
+        final_results_out = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset_out, original_args)
         
-        print("\nBreakdown by question type (MCQ Trained):")
-        for q_field, _ in QA_FIELDS:
-            trained_key = f"mcq_trained_{q_field}"
-            untrained_key = f"mcq_untrained_{q_field}"
-            if trained_key in final_results and untrained_key in final_results:
-                improvement = final_results[trained_key] - final_results[untrained_key]
-                print(f"  {q_field}: Trained={final_results[trained_key]:.4f}, Untrained={final_results[untrained_key]:.4f}, Diff={improvement:.4f}")
-    
-    # Log final results to wandb
-    log_data = {
-        "final/qa_overall_accuracy": final_results["overall"],
-        "final/qa_bdate_accuracy": final_results["bdate_q"],
-        "final/qa_bcity_accuracy": final_results["bcity_q"],
-        "final/qa_university_accuracy": final_results["university_q"],
-        "final/qa_major_accuracy": final_results["major_q"],
-        "final/qa_employer_accuracy": final_results["employer_q"],
-        "final/qa_company_city_accuracy": final_results["company_city_q"]
-    }
-    
-    # Add MCQ specific metrics to final results if available
-    if mcq_indices and args.mcq_percentage > 0:
-        log_data.update({
-            "final/mcq_trained_overall": final_results["mcq_trained_overall"],
-            "final/mcq_untrained_overall": final_results["mcq_untrained_overall"],
-            "final/mcq_improvement": final_results["mcq_trained_overall"] - final_results["mcq_untrained_overall"]
+        print(f"\nFinal Evaluation (MCQ subset) Overall Accuracy: {final_results_in['overall']:.4f}")
+        print(f"Final Evaluation (Non-MCQ subset) Overall Accuracy: {final_results_out['overall']:.4f}")
+        
+        wandb.log({
+            "final/in_qa_overall_accuracy": final_results_in["overall"],
+            "final/in_qa_bdate_accuracy": final_results_in["bdate_q"],
+            "final/in_qa_bcity_accuracy": final_results_in["bcity_q"],
+            "final/in_qa_university_accuracy": final_results_in["university_q"],
+            "final/in_qa_major_accuracy": final_results_in["major_q"],
+            "final/in_qa_employer_accuracy": final_results_in["employer_q"],
+            "final/in_qa_company_city_accuracy": final_results_in["company_city_q"],
+            "final/out_qa_overall_accuracy": final_results_out["overall"],
+            "final/out_qa_bdate_accuracy": final_results_out["bdate_q"],
+            "final/out_qa_bcity_accuracy": final_results_out["bcity_q"],
+            "final/out_qa_university_accuracy": final_results_out["university_q"],
+            "final/out_qa_major_accuracy": final_results_out["major_q"],
+            "final/out_qa_employer_accuracy": final_results_out["employer_q"],
+            "final/out_qa_company_city_accuracy": final_results_out["company_city_q"],
         })
-        
-        # Add detailed metrics for each question type
-        for q_field, _ in QA_FIELDS:
-            trained_key = f"mcq_trained_{q_field}"
-            untrained_key = f"mcq_untrained_{q_field}"
-            if trained_key in final_results and untrained_key in final_results:
-                log_data[f"final/mcq_trained_{q_field}"] = final_results[trained_key]
-                log_data[f"final/mcq_untrained_{q_field}"] = final_results[untrained_key]
-                log_data[f"final/mcq_improvement_{q_field}"] = final_results[trained_key] - final_results[untrained_key]
-    
-    # Add overfitting metrics if shuffled results are available
-    if shuffled_results:
-        log_data.update({
-            "overfitting/original_overall": final_results["overall"],
-            "overfitting/shuffled_overall": shuffled_results["overall"],
-            "overfitting/difference": final_results["overall"] - shuffled_results["overall"]
+    else:
+        final_results = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset, original_args)
+        print(f"\nFinal Overall Accuracy: {final_results['overall']:.4f}")
+        wandb.log({
+            "final/qa_overall_accuracy": final_results["overall"],
+            "final/qa_bdate_accuracy": final_results["bdate_q"],
+            "final/qa_bcity_accuracy": final_results["bcity_q"],
+            "final/qa_university_accuracy": final_results["university_q"],
+            "final/qa_major_accuracy": final_results["major_q"],
+            "final/qa_employer_accuracy": final_results["employer_q"],
+            "final/qa_company_city_accuracy": final_results["company_city_q"]
         })
-        
-        # Add per-question type overfitting metrics
-        for q_field, _ in QA_FIELDS:
-            log_data[f"overfitting/original_{q_field}"] = final_results[q_field]
-            log_data[f"overfitting/shuffled_{q_field}"] = shuffled_results[q_field]
-            log_data[f"overfitting/difference_{q_field}"] = final_results[q_field] - shuffled_results[q_field]
-    
-    wandb.log(log_data)
-    
-    # Add summary metrics that will appear on the main wandb runs page
-    wandb.run.summary["final_overall_accuracy"] = final_results["overall"]
-    if mcq_indices and args.mcq_percentage > 0:
-        wandb.run.summary["final_mcq_trained_accuracy"] = final_results["mcq_trained_overall"]
-        wandb.run.summary["final_mcq_untrained_accuracy"] = final_results["mcq_untrained_overall"]
-        wandb.run.summary["final_mcq_improvement"] = final_results["mcq_trained_overall"] - final_results["mcq_untrained_overall"]
-    
-    # Add overfitting metrics to summary
-    if shuffled_results:
-        wandb.run.summary["overfitting_score"] = final_results["overall"] - shuffled_results["overall"]
-    
-    # Create a table to show results by question type
-    qa_table = wandb.Table(columns=["Question Type", "Accuracy"])
-    for question_type, accuracy in final_results.items():
-        if question_type != "overall" and not question_type.startswith("mcq_"):  # Skip overall and MCQ specific
-            question_name = question_type.replace("_q", "").capitalize()
-            qa_table.add_data(question_name, accuracy)
-    
-    wandb.log({"final_results_table": qa_table})
-    
-    # Create histogram of accuracies for different question types
-    accuracies = [acc for qtype, acc in final_results.items() 
-                if qtype != "overall" and not qtype.startswith("mcq_")]
-    question_types = [qtype.replace("_q", "").capitalize() for qtype in final_results.keys() 
-                    if qtype != "overall" and not qtype.startswith("mcq_")]
-    
-    # Create a bar chart - simpler approach
-    data = [[label, val] for label, val in zip(question_types, accuracies)]
-    table = wandb.Table(data=data, columns=["Question Type", "Accuracy"])
-    # Log the table directly, W&B will create a visualization
-    wandb.log({"accuracy_by_question_type": table})
-    
-    # Create a comparison chart for MCQ trained vs untrained if available
-    if mcq_indices and args.mcq_percentage > 0:
-        mcq_data = []
-        for q_field, _ in QA_FIELDS:
-            trained_key = f"mcq_trained_{q_field}"
-            untrained_key = f"mcq_untrained_{q_field}"
-            if trained_key in final_results and untrained_key in final_results:
-                q_name = q_field.replace("_q", "").capitalize()
-                mcq_data.append([q_name, "Trained", final_results[trained_key]])
-                mcq_data.append([q_name, "Untrained", final_results[untrained_key]])
-        
-        # Also add overall comparison
-        mcq_data.append(["Overall", "Trained", final_results["mcq_trained_overall"]])
-        mcq_data.append(["Overall", "Untrained", final_results["mcq_untrained_overall"]])
-        
-        # Create table and chart - simpler approach
-        mcq_table = wandb.Table(data=mcq_data, columns=["Question Type", "Training", "Accuracy"])
-        # Log the table directly, W&B will create a visualization
-        wandb.log({"mcq_comparison": mcq_table})
-    
-    # Create an overfitting analysis chart if available
-    if shuffled_results:
-        overfitting_data = []
-        for q_field, _ in QA_FIELDS:
-            q_name = q_field.replace("_q", "").capitalize()
-            overfitting_data.append([q_name, "Original Order", final_results[q_field]])
-            overfitting_data.append([q_name, "Shuffled Order", shuffled_results[q_field]])
-        
-        # Add overall comparison
-        overfitting_data.append(["Overall", "Original Order", final_results["overall"]])
-        overfitting_data.append(["Overall", "Shuffled Order", shuffled_results["overall"]])
-        
-        # Create table and chart - simpler approach
-        overfitting_table = wandb.Table(data=overfitting_data, columns=["Question Type", "Evaluation", "Accuracy"])
-        # Log the table directly, W&B will create a visualization
-        wandb.log({"overfitting_analysis": overfitting_table})
-        
-        # Create a table specifically for the difference (for easier visualization)
-        diff_data = []
-        for q_field, _ in QA_FIELDS:
-            q_name = q_field.replace("_q", "").capitalize()
-            diff = final_results[q_field] - shuffled_results[q_field]
-            diff_data.append([q_name, diff])
-        
-        # Add overall difference
-        overall_diff = final_results["overall"] - shuffled_results["overall"]
-        diff_data.append(["Overall", overall_diff])
-        
-        # Create table and chart - simpler approach
-        diff_table = wandb.Table(data=diff_data, columns=["Question Type", "Accuracy Drop"])
-        # Log the table directly, W&B will create a visualization
-        wandb.log({"overfitting_difference": diff_table})
-    
     # Finish wandb run
     wandb.finish()
     

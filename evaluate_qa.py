@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
     return parser.parse_args()
 
-def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices=4, shuffle_choices=False):
+def create_multiple_choice_prompt(question, correct_answer, dataset, a_field, with_fewshot=True):
     """Create a multiple-choice prompt with one correct and three incorrect answers.
     
     Args:
@@ -66,91 +66,63 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, num_choices
     """
     options = [" A", " B", " C", " D"]
     
-    # Find field type from question
-    qa_field = None
-    for q_field, a_field in QA_FIELDS:
-        if question.startswith(dataset[0][q_field].split()[0]):
-            qa_field = a_field
-            break
+    all_field_answers = precomputed_answers[a_field]
+        
+    # Filter out the correct answer
+    available_options = [a for a in all_field_answers if a != correct_answer]
     
-    if not qa_field:
-        print(f"Could not identify question type for: {question}")
-        return None, None
+    random.shuffle(available_options)
     
-    # Check for precomputed answers first (fastest)
-    if precomputed_answers and qa_field in precomputed_answers:
-        all_field_answers = precomputed_answers[qa_field]
-        
-        # Filter out the correct answer
-        available_options = [a for a in all_field_answers if a != correct_answer]
-        
-        if shuffle_choices:
-            # Use a seed based on question for consistent but different patterns
-            question_hash = hash(question) % 10000
-            local_random = random.Random(question_hash)
-            local_random.shuffle(available_options)
-        else:
-            # Just shuffle once to get random incorrect answers
-            random.shuffle(available_options)
-        
-        # Take first 3 as incorrect answers
-        incorrect_answers = available_options[:3]
-        
-        # If we somehow don't have enough options, fall back to old method
-        if len(incorrect_answers) < 3:
-            print(f"Warning: Not enough unique answers for {qa_field}, using fallback method")
-            # Fallback to original implementation
-            incorrect_answers = []
-            while len(incorrect_answers) < 3:
-                random_idx = random.randint(0, len(dataset) - 1)
-                random_answer = dataset[random_idx][qa_field]
-                if random_answer != correct_answer and random_answer not in incorrect_answers:
-                    incorrect_answers.append(random_answer)
-    # Fallback to dynamically collected answers if available
-    elif hasattr(create_multiple_choice_prompt, 'all_answers_by_field') and qa_field in create_multiple_choice_prompt.all_answers_by_field:
-        # Get list of all possible answers for this field
-        all_field_answers = create_multiple_choice_prompt.all_answers_by_field[qa_field]
-        
-        # Filter out the correct answer
-        available_options = [a for a in all_field_answers if a != correct_answer]
-        
-        if shuffle_choices:
-            # Use a seed based on question for consistent but different patterns
-            question_hash = hash(question) % 10000
-            local_random = random.Random(question_hash)
-            local_random.shuffle(available_options)
-        else:
-            # Just shuffle once to get random incorrect answers
-            random.shuffle(available_options)
-        
-        # Take first 3 as incorrect answers
-        incorrect_answers = available_options[:3]
-        
-        # If we somehow don't have enough options, fall back to old method
-        if len(incorrect_answers) < 3:
-            print(f"Warning: Not enough unique answers for {qa_field}, using fallback method")
-            # Fallback to original implementation
-            incorrect_answers = []
-            while len(incorrect_answers) < 3:
-                random_idx = random.randint(0, len(dataset) - 1)
-                random_answer = dataset[random_idx][qa_field]
-                if random_answer != correct_answer and random_answer not in incorrect_answers:
-                    incorrect_answers.append(random_answer)
-    else:
-        # Fallback to original implementation - get 3 random incorrect answers
+    # Take first 3 as incorrect answers
+    incorrect_answers = available_options[:3]
+    
+    # If we somehow don't have enough options, fall back to old method
+    if len(incorrect_answers) < 3:
+        print(f"Warning: Not enough unique answers for {a_field}, using fallback method")
+        # Fallback to original implementation
         incorrect_answers = []
         while len(incorrect_answers) < 3:
             random_idx = random.randint(0, len(dataset) - 1)
-            random_answer = dataset[random_idx][qa_field]
+            random_answer = dataset[random_idx][a_field]
             if random_answer != correct_answer and random_answer not in incorrect_answers:
                 incorrect_answers.append(random_answer)
-    
+   
     # Create choices list with the correct answer at a random position
     choices = incorrect_answers.copy()
     correct_idx = random.randint(0, 3)
     choices.insert(correct_idx, correct_answer)
     
-    prompt = f"{question}\n"
+    # Add few-shot examples for better model guidance
+    few_shot_examples = """Example 1:
+When was Will Smith born?
+ A. January 8, 1987
+ B. April 23, 1975
+ C. June 12, 1990
+ D. September 25, 1968
+Answer: D. September 25, 1968
+
+Example 2:
+Where was Cameron Diaz born?
+ A. Chicago, Illinois
+ B. Portland, Oregon
+ C. San Diego, California
+ D. Seattle, Washington
+Answer: C. San Diego, California
+
+Example 3:
+What company does Sergey Brin work for?
+ A. Microsoft
+ B. Google
+ C. Amazon
+ D. Apple
+Answer: B. Google
+
+Example 4:
+"""
+    if with_fewshot:
+        prompt = few_shot_examples + f"{question}\n"
+    else:
+        prompt = f"{question}\n"
         
     # Add the choices
     for i, (option, choice) in enumerate(zip(options, choices)):
@@ -201,8 +173,39 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
         # Get all logits for the batch
         with torch.no_grad():
             outputs = model(**batch_inputs)
-            # Get the last token logits for each sequence in the batch
-            batch_logits = outputs.logits[:, -1, :]
+            
+            # We need to find the position after the last "Answer:" token for each example
+            batch_size = batch_inputs["input_ids"].shape[0]
+            batch_logits = []
+            
+            for j in range(batch_size):
+                # Get tokens for current example
+                input_ids = batch_inputs["input_ids"][j]
+                tokens = tokenizer.convert_ids_to_tokens(input_ids)
+                
+                # Find all "Answer:" occurrences (looking for the token "Answer")
+                answer_positions = []
+                for idx, token in enumerate(tokens):
+                    if token == "Answer" or token == "Ġanswer" or token == "ĠAnswer":
+                        # Check if next token is ":" or if ":" is part of the same token
+                        if idx + 1 < len(tokens) and tokens[idx + 1] == ":":
+                            answer_positions.append(idx + 1)  # Position of ":"
+                        elif idx < len(tokens) and ":" in token:
+                            answer_positions.append(idx)  # Position of the combined token
+                
+                # Use the last "Answer:" position
+                if answer_positions:
+                    # We want to use the token position of ":" in the last "Answer:"
+                    answer_pos = answer_positions[-1]  # Position of ":"
+                    
+                    # Instead of looking at the token after ":", we'll look at the ":" token itself
+                    # This handles cases where the "Answer:" is at the end of the sequence
+                else:
+                    answer_pos = -1  # Default to last position
+                
+                # Get logits for the token position
+                example_logits = outputs.logits[j, answer_pos, :]
+                batch_logits.append(example_logits)
         
         # For each item in the batch, find predicted answer
         for j, (logits, correct_answer) in enumerate(zip(batch_logits, batch_answers)):
@@ -212,14 +215,15 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
             # Get the model's prediction (option with highest score)
             model_answer = max(option_scores.items(), key=lambda x: x[1])[0]
             
-            # Debug: print prediction details for first few examples
-            if debug and i == 0 and j < 3:
-                print(f"\n=== DEBUG: Prediction for example {j} ===")
-                print(f"Prompt: {batch_prompts[j]}")
+            # Debug: print prediction details for all examples when in debug mode
+            if debug:
+                print(f"\n=== DEBUG: Prediction for example {i*batch_size + j} ===")
+                print(f"Full Prompt:\n{batch_prompts[j]}")
                 print(f"Options scores: {option_scores}")
                 print(f"Model prediction: {model_answer}")
                 print(f"Correct answer: {correct_answer}")
                 print(f"Correct? {'✓' if model_answer == correct_answer else '✗'}")
+                print("-" * 50)  # Separator for readability
             
             # Check if the prediction is correct
             if model_answer == correct_answer:
@@ -252,7 +256,7 @@ def evaluate_qa_by_type(model, tokenizer, test_dataset, args):
             correct_answer = test_dataset[i][a_field]
             
             prompt, correct_option = create_multiple_choice_prompt(
-                question, correct_answer, test_dataset
+                question, correct_answer, test_dataset, a_field
             )
             
             if prompt and correct_option:
