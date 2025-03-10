@@ -246,9 +246,6 @@ class BioDataset(torch.utils.data.Dataset):
             # Add MCQ examples to the list of training examples
             self.examples.extend(mcq_examples)
             
-            # Shuffle the complete list of examples
-            random.shuffle(self.examples)
-            
             # Calculate actual counts for reporting
             if mcq_with_bios:
                 print(f"Added {len(mcq_examples)} MCQ examples with bioS text.")
@@ -271,6 +268,8 @@ class BioDataset(torch.utils.data.Dataset):
             for i in range(min(3, len(self.examples))):
                 print(f"\nExample {i}:")
                 print(self.examples[i])
+        # Shuffle the complete list of examples
+        random.shuffle(self.examples)
     
     def __len__(self):
         return len(self.examples)
@@ -300,7 +299,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="./model-output", help="Directory to save model")
     parser.add_argument("--model_name_or_path", type=str, default="gpt2-xl", help="Model to fine-tune")
     parser.add_argument("--model_type", type=str, default="gpt2", 
-                    choices=["gpt2", "gpt-j", "gpt-neox", "llama"], 
+                    choices=["gpt2", "gpt-j", "gpt-neox", "llama", "olmo"], 
                     help="Type of model to fine-tune")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Batch size per device")
@@ -435,8 +434,10 @@ def main():
             use_cache=False,
             quantization_config=quantization_config,
             # Change dtype based on model type and fp16 flag (only if not using quantization)
-            torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"] and not args.load_in_8bit else torch.float32
+            torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] and not args.load_in_8bit else torch.float32
         )
+    
+    # model.to("cuda")z
     
     # For quantized models, we need to use LoRA
     if args.load_in_8bit:
@@ -508,6 +509,13 @@ def main():
                 param.requires_grad = False
             for param in model.lm_head.parameters():
                 param.requires_grad = False
+        elif args.model_type == "olmo":
+            for param in model.model.embed_tokens.parameters():
+                param.requires_grad = False
+            for param in model.model.rotary_emb.parameters():
+                param.requires_grad = False
+            for param in model.lm_head.parameters():
+                param.requires_grad = False
 
     if args.gradient_checkpointing:
         print("Enabling gradient checkpointing...")
@@ -542,6 +550,8 @@ def main():
                 model.transformer.wte.register_forward_hook(embedding_forward_hook)
             elif args.model_type == "gpt-neox":
                 model.gpt_neox.embed_in.register_forward_hook(embedding_forward_hook)
+            elif args.model_type =="olmo":
+                model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
         
         model.gradient_checkpointing_enable()
     
@@ -588,8 +598,9 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         warmup_steps=warmup_steps,
         fp16=args.fp16 and args.model_type == "gpt2" and not args.load_in_8bit,  # Use fp16 only for gpt2
-        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox"] and not args.load_in_8bit,  # Use bf16 for llama, gpt-j, and gpt-neox
-        half_precision_backend="auto"
+        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] and not args.load_in_8bit,  # Use bf16 for llama, gpt-j, and gpt-neox
+        half_precision_backend="auto",
+        # deepspeed="ds_config.json" if args.model_type in ["llama", "gpt-j", "gpt-neox"] else None
     )
             
     # Create a custom data collator

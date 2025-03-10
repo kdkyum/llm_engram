@@ -50,20 +50,7 @@ def parse_args():
     return parser.parse_args()
 
 def create_multiple_choice_prompt(question, correct_answer, dataset, a_field, with_fewshot=True):
-    """Create a multiple-choice prompt with one correct and three incorrect answers.
-    
-    Args:
-        question: The question text
-        correct_answer: The correct answer
-        dataset: The dataset to sample other answers from
-        num_choices: Number of choices to include (default 4)
-        shuffle_choices: Whether to shuffle the incorrect choices to create 
-                         different patterns (used for evaluation to test for overfitting)
-    
-    Returns:
-        prompt: The formatted prompt with question and choices
-        correct_option: The option letter (e.g., " A") corresponding to the correct answer
-    """
+    """Create a multiple-choice prompt where the model should respond with the actual answer."""
     options = [" A", " B", " C", " D"]
     
     all_field_answers = precomputed_answers[a_field]
@@ -92,14 +79,14 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, a_field, wi
     correct_idx = random.randint(0, 3)
     choices.insert(correct_idx, correct_answer)
     
-    # Add few-shot examples for better model guidance
+    # Updated few-shot examples to demonstrate direct answer format
     few_shot_examples = """Example 1:
 When was Will Smith born?
  A. January 8, 1987
  B. April 23, 1975
  C. June 12, 1990
  D. September 25, 1968
-Answer: D. September 25, 1968
+Answer: September 25, 1968
 
 Example 2:
 Where was Cameron Diaz born?
@@ -107,7 +94,7 @@ Where was Cameron Diaz born?
  B. Portland, Oregon
  C. San Diego, California
  D. Seattle, Washington
-Answer: C. San Diego, California
+Answer: San Diego, California
 
 Example 3:
 What company does Sergey Brin work for?
@@ -115,7 +102,7 @@ What company does Sergey Brin work for?
  B. Google
  C. Amazon
  D. Apple
-Answer: B. Google
+Answer: Google
 
 Example 4:
 """
@@ -129,107 +116,78 @@ Example 4:
         prompt += f" {option}. {choice}\n"
     prompt += "Answer:"
     
-    return prompt, options[correct_idx]
+    return prompt, correct_answer  # Return the actual answer, not the option letter
 
 def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, debug=False):
-    """Score the model's accuracy on multiple-choice questions with batching."""
+    """Score the model's accuracy on multiple-choice questions using direct answer generation."""
     if not prompts_and_answers:
         return 0
     
     correct = 0
-    options = [" A", " B", " C", " D"]
-    option_tokens = {opt: tokenizer(opt, add_special_tokens=False).input_ids[0] for opt in options}
-    
-    # Print option tokens for debugging
-    if debug:
-        print("\n=== DEBUG: Option tokens ===")
-        for opt, token_id in option_tokens.items():
-            token = tokenizer.convert_ids_to_tokens([token_id])[0]
-            print(f"Option {opt}: token_id={token_id}, token={token}")
+    total = len(prompts_and_answers)
     
     # Process in batches
-    for i in tqdm(range(0, len(prompts_and_answers), batch_size)):
+    for i in tqdm(range(0, total, batch_size)):
         batch_prompts = [p[0] for p in prompts_and_answers[i:i+batch_size]]
         batch_answers = [p[1] for p in prompts_and_answers[i:i+batch_size]]
-            
+        
         # Tokenize all prompts in the batch
         batch_inputs = tokenizer(batch_prompts, padding=True, return_tensors="pt").to(device)
-
-        # Debug: print a sample prompt from batch_inputs
+        
+        # Debug: print a sample prompt
         if debug and i == 0:
             print("\n=== DEBUG: Sample QA prompt ===")
-            # Decode the first sequence from batch_inputs
             sample_prompt = tokenizer.decode(batch_inputs['input_ids'][0])
             print(f"Prompt: {sample_prompt}")
             print(f"Correct answer: {batch_answers[0]}")
-            
-            # Show tokenization details
-            tokens = tokenizer.convert_ids_to_tokens(batch_inputs['input_ids'][0])
-            token_ids = batch_inputs['input_ids'][0].tolist()
-            print("\nTokenization:")
-            for idx, (token, token_id) in enumerate(zip(tokens, token_ids)):
-                print(f"Position {idx}: '{token}' (ID: {token_id})")
         
-        # Get all logits for the batch
+        # Generate predictions using greedy decoding
         with torch.no_grad():
-            outputs = model(**batch_inputs)
-            
-            # We need to find the position after the last "Answer:" token for each example
-            batch_size = batch_inputs["input_ids"].shape[0]
-            batch_logits = []
-            
-            for j in range(batch_size):
-                # Get tokens for current example
-                input_ids = batch_inputs["input_ids"][j]
-                tokens = tokenizer.convert_ids_to_tokens(input_ids)
-                
-                # Find all "Answer:" occurrences (looking for the token "Answer")
-                answer_positions = []
-                for idx, token in enumerate(tokens):
-                    if token == "Answer" or token == "Ġanswer" or token == "ĠAnswer":
-                        # Check if next token is ":" or if ":" is part of the same token
-                        if idx + 1 < len(tokens) and tokens[idx + 1] == ":":
-                            answer_positions.append(idx + 1)  # Position of ":"
-                        elif idx < len(tokens) and ":" in token:
-                            answer_positions.append(idx)  # Position of the combined token
-                
-                # Use the last "Answer:" position
-                if answer_positions:
-                    # We want to use the token position of ":" in the last "Answer:"
-                    answer_pos = answer_positions[-1]  # Position of ":"
-                    
-                    # Instead of looking at the token after ":", we'll look at the ":" token itself
-                    # This handles cases where the "Answer:" is at the end of the sequence
-                else:
-                    answer_pos = -1  # Default to last position
-                
-                # Get logits for the token position
-                example_logits = outputs.logits[j, answer_pos, :]
-                batch_logits.append(example_logits)
+            generated_outputs = model.generate(
+                batch_inputs.input_ids,
+                attention_mask=batch_inputs.attention_mask,
+                max_new_tokens=10,  # Generate more tokens to capture full answer
+                do_sample=False,   # Use greedy decoding
+                pad_token_id=tokenizer.pad_token_id
+            )
         
-        # For each item in the batch, find predicted answer
-        for j, (logits, correct_answer) in enumerate(zip(batch_logits, batch_answers)):
-            # Calculate scores for each option
-            option_scores = {opt: logits[token_id].item() for opt, token_id in option_tokens.items()}
+        # Process each example in the batch
+        for j, (output, correct_answer) in enumerate(zip(generated_outputs, batch_answers)):
+            # Extract generated tokens (excluding input)
+            input_length = batch_inputs.input_ids[j].size(0)
+            generated_ids = output[input_length:] if input_length < len(output) else []
             
-            # Get the model's prediction (option with highest score)
-            model_answer = max(option_scores.items(), key=lambda x: x[1])[0]
+            # Decode the generated tokens
+            generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             
-            # Debug: print prediction details for all examples when in debug mode
+            # Get first sentence or line of generation (the answer)
+            generated_answer = generated_text.split('\n')[0].split('.')[0].strip()
+            
+            # Normalize both for comparison
+            gen_norm = generated_answer.lower().strip()
+            correct_norm = correct_answer.lower().strip()
+            
+            # Check for match or partial match (answer might be cut off)
+            is_correct = (gen_norm == correct_norm or 
+                         gen_norm.startswith(correct_norm) or 
+                         correct_norm.startswith(gen_norm))
+            
+            if is_correct:
+                correct += 1
+            
+            # Debug: print prediction details
             if debug:
                 print(f"\n=== DEBUG: Prediction for example {i*batch_size + j} ===")
-                print(f"Full Prompt:\n{batch_prompts[j]}")
-                print(f"Options scores: {option_scores}")
-                print(f"Model prediction: {model_answer}")
-                print(f"Correct answer: {correct_answer}")
-                print(f"Correct? {'✓' if model_answer == correct_answer else '✗'}")
-                print("-" * 50)  # Separator for readability
-            
-            # Check if the prediction is correct
-            if model_answer == correct_answer:
-                correct += 1
+                print(f"Prompt ending: ...{batch_prompts[j][-50:]}")  # Last part of prompt
+                print(f"Generated text: '{generated_text}'")
+                print(f"Extracted answer: '{generated_answer}'")
+                print(f"Normalized generated: '{gen_norm}'")
+                print(f"Correct answer: '{correct_answer}'")
+                print(f"Normalized correct: '{correct_norm}'")
+                print(f"Correct? {'✓' if is_correct else '✗'}")
+                print("-" * 50)
     
-    accuracy = correct / len(prompts_and_answers)
+    accuracy = correct / total
     return accuracy
 
 def evaluate_qa_by_type(model, tokenizer, test_dataset, args):

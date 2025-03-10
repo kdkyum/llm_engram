@@ -8,6 +8,7 @@ from datetime import datetime
 def parse_args():
     parser = argparse.ArgumentParser(description="Train multiple LLM models")
     parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_samples", type=int, default=10, help="Maximum number of samples to use from dataset")
     parser.add_argument("--eval_samples", type=int, default=10, help="Number of samples to use for evaluation")
     parser.add_argument("--bio_field", type=str, default="bioS", help="Which bio field to use for training")
@@ -24,20 +25,23 @@ def main():
     args = parse_args()
 
     # Define all possible bio fields
-    bio_fields = ["bioS"] #, "bioS_fullname", "bioS_multi5_permutes"]
+    bio_fields = ["bioS_multi5_permutes"] #]
     
     # Define models to train
     models = [
         # GPT-2 models
-        # {"name": "gpt2", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
-        # {"name": "gpt2-medium", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
-        # {"name": "gpt2-large", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
-        # {"name": "gpt2-xl", "type": "gpt2", "default_lr": 5e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": 1},
-        {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "eval_batch_size": 1},
-        {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
-        #meta-llama/Llama-2-13b-hf
-        # {"name": "meta-llama/Llama-2-13b-hf", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True},
+        # {"name": "gpt2", "type": "gpt2", "default_lr": 2e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": args.batch_size, "eval_batch_size": 10},
+        # {"name": "gpt2-medium", "type": "gpt2", "default_lr": 2e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": args.batch_size, "eval_batch_size": 10},
+        # {"name": "gpt2-large", "type": "gpt2", "default_lr": 2e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": args.batch_size, "eval_batch_size": 10},
+        # {"name": "gpt2-xl", "type": "gpt2", "default_lr": 2e-5, "gradient_accumulation_steps": 1, "per_device_train_batch_size": args.batch_size, "eval_batch_size": 10},
+        # {"name": "meta-llama/Llama-3.2-1B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-3.2-3B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        # {"name": "EleutherAI/gpt-j-6B", "type": "gpt-j", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-2-7b-hf", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-2-13b-hf", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "allenai/OLMo-2-1124-7B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "allenai/OLMo-2-1124-13B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         #meta-llama/Llama-2-70b-hf
         # {"name": "meta-llama/Llama-2-70b-hf", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True}
     ]
@@ -50,9 +54,8 @@ def main():
             default_lr = model_info["default_lr"]
             # Create a range: 1x, 2x, and 5x the default learning rate
             lr_values.extend([
-                default_lr,
-                default_lr / 2.0,
-                default_lr / 5.0
+                2e-5,
+                5e-5
             ])
         # Remove duplicates and sort
         lr_values = sorted(list(set(lr_values)))
@@ -105,8 +108,8 @@ def main():
                 print(f"{'-'*60}")
                 
                 # Build command
-                cmd = [
-                    "python", "train_model.py",
+                cmd = ["python",
+                    "train_model.py",
                     "--model_name_or_path", model_name,
                     "--model_type", model_type,
                     "--learning_rate", str(learning_rate),
@@ -119,7 +122,7 @@ def main():
                     "--bio_field", bio_field,  # Use current bio field
                     "--output_dir", output_dir,
                     "--wandb_run_name", f"{model_short_name}-{bio_field}-lr{lr_str}",
-                    "--freeze_embeddings",
+                    # "--freeze_embeddings",
                     "--mcq_percentage", str(args.mcq_percentage)
                 ]
                 
