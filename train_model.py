@@ -36,6 +36,9 @@ class QAEvaluationCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.args = args
         self.eval_steps = 0
+        self.best_accuracy = 0.0
+        self.best_model_path = os.path.join(args.output_dir, "best_model")
+        os.makedirs(self.best_model_path, exist_ok=True)
 
     def on_epoch_end(self, args, state, control, **kwargs):
         """Run evaluation at the end of each epoch"""
@@ -62,6 +65,26 @@ class QAEvaluationCallback(TrainerCallback):
             print(f"Evaluating model on {eval_samples} samples...")
             qa_results = self.evaluate_qa(model, self.tokenizer, self.eval_dataset, self.args)
             
+            # Check if this is the best model so far
+            current_accuracy = qa_results["overall"]
+            if current_accuracy > self.best_accuracy:
+                self.best_accuracy = current_accuracy
+                print(f"\n=== New best model found! Accuracy: {current_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+                
+                # Save the best model
+                print(f"Saving best model to {self.best_model_path}")
+                self.trainer.save_model(self.best_model_path)
+                self.tokenizer.save_pretrained(self.best_model_path)
+                
+                # Save best model metrics
+                with open(os.path.join(self.best_model_path, "best_metrics.txt"), "w") as f:
+                    f.write(f"Epoch: {state.epoch:.2f}\n")
+                    f.write(f"Step: {state.global_step}\n")
+                    f.write(f"Overall accuracy: {qa_results['overall']:.4f}\n")
+                    for question_type, accuracy in qa_results.items():
+                        if question_type != "overall":
+                            f.write(f"{question_type}: {accuracy:.4f}\n")
+            
             # Log to wandb with eval step to distinguish between evaluations
             wandb.log({
                 "eval/step": self.eval_steps,
@@ -73,14 +96,16 @@ class QAEvaluationCallback(TrainerCallback):
                 "eval/qa_major_accuracy": qa_results["major_q"],
                 "eval/qa_employer_accuracy": qa_results["employer_q"],
                 "eval/qa_company_city_accuracy": qa_results["company_city_q"],
+                "eval/is_best_model": 1 if current_accuracy == self.best_accuracy else 0,
             }, step=state.global_step)
-            
             
             print(f"\n===== QA EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
             for question_type, accuracy in qa_results.items():
                 if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics in the print output
                     print(f"{question_type}: {accuracy:.4f}")
             print(f"Overall Accuracy: {qa_results['overall']:.4f}")
+            if qa_results["overall"] == self.best_accuracy:
+                print("(Best model so far)")
             
         except Exception as e:
             print(f"Error during evaluation: {e}")
@@ -591,7 +616,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
-        save_strategy="no",  # Don't save model every epoch
+        save_strategy="no",  # Don't save model automatically
         eval_strategy="no",  # We'll do our own evaluation with the callback
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
         report_to="wandb",
@@ -620,81 +645,54 @@ def main():
     # Get MCQ indices for evaluation comparison from the dataset
     mcq_indices = tokenized_train.mcq_indices if hasattr(tokenized_train, 'mcq_indices') else set()
    
-    # Register the callback
-    if args.mcq_percentage > 0:
-        print(f"Adding evaluation callback with MCQ comparison (tracked {len(mcq_indices)} samples with MCQ training)")
-    
-    # Train model
-    print("Training model...")
-    trainer.train()
-
-    # Save model
-    print(f"Saving model to {output_dir}...")
-    trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    
-    # Final evaluation using MCQ format on the full training dataset
-    print("Performing final QA evaluation using MCQ format...")
-    model.eval()
-    
-    # First evaluate with original choice order (same as used in training)
-    original_args = copy.deepcopy(args)
-
-    # Initialize the QA evaluation callback
+    # Register the QA evaluation callback
     qa_eval_callback = QAEvaluationCallback(
         trainer=trainer,
         eval_dataset=train_dataset,
         tokenizer=tokenizer,
         args=args,
     )
+    trainer.add_callback(qa_eval_callback)
     
-    if mcq_indices:
-        # Split train_dataset into two subsets: one with indices in mcq_indices and one with the rest
-        train_dataset_in = train_dataset.select(list(mcq_indices))
-        all_indices = set(range(len(train_dataset)))
-        non_mcq_indices = list(all_indices - mcq_indices)
-        train_dataset_out = train_dataset.select(non_mcq_indices)
-        
-        print("Evaluating on MCQ indices subset...")
-        final_results_in = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset_in, original_args)
-        print("Evaluating on non-MCQ indices subset...")
-        final_results_out = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset_out, original_args)
-        
-        print(f"\nFinal Evaluation (MCQ subset) Overall Accuracy: {final_results_in['overall']:.4f}")
-        print(f"Final Evaluation (Non-MCQ subset) Overall Accuracy: {final_results_out['overall']:.4f}")
-        
-        wandb.log({
-            "final/in_qa_overall_accuracy": final_results_in["overall"],
-            "final/in_qa_bdate_accuracy": final_results_in["bdate_q"],
-            "final/in_qa_bcity_accuracy": final_results_in["bcity_q"],
-            "final/in_qa_university_accuracy": final_results_in["university_q"],
-            "final/in_qa_major_accuracy": final_results_in["major_q"],
-            "final/in_qa_employer_accuracy": final_results_in["employer_q"],
-            "final/in_qa_company_city_accuracy": final_results_in["company_city_q"],
-            "final/out_qa_overall_accuracy": final_results_out["overall"],
-            "final/out_qa_bdate_accuracy": final_results_out["bdate_q"],
-            "final/out_qa_bcity_accuracy": final_results_out["bcity_q"],
-            "final/out_qa_university_accuracy": final_results_out["university_q"],
-            "final/out_qa_major_accuracy": final_results_out["major_q"],
-            "final/out_qa_employer_accuracy": final_results_out["employer_q"],
-            "final/out_qa_company_city_accuracy": final_results_out["company_city_q"],
-        })
-    else:
-        final_results = qa_eval_callback.evaluate_qa(model, tokenizer, train_dataset, original_args)
-        print(f"\nFinal Overall Accuracy: {final_results['overall']:.4f}")
-        wandb.log({
-            "final/qa_overall_accuracy": final_results["overall"],
-            "final/qa_bdate_accuracy": final_results["bdate_q"],
-            "final/qa_bcity_accuracy": final_results["bcity_q"],
-            "final/qa_university_accuracy": final_results["university_q"],
-            "final/qa_major_accuracy": final_results["major_q"],
-            "final/qa_employer_accuracy": final_results["employer_q"],
-            "final/qa_company_city_accuracy": final_results["company_city_q"]
-        })
-    # Finish wandb run
-    wandb.finish()
-    
-    print("Training and evaluation complete!")
+    # Train model
+    print("Training model...")
+    trainer.train()
 
+    # Print best model information
+    print(f"Best model saved at {qa_eval_callback.best_model_path}")
+    print(f"Best accuracy: {qa_eval_callback.best_accuracy:.4f}")
+    
+    # Load the best model metrics
+    best_metrics_path = os.path.join(qa_eval_callback.best_model_path, "best_metrics.txt")
+    best_epoch = None
+    best_step = None
+    category_metrics = {}
+    
+    if os.path.exists(best_metrics_path):
+        with open(best_metrics_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("Epoch:"):
+                    best_epoch = float(line.split(":", 1)[1].strip())
+                elif line.startswith("Step:"):
+                    best_step = int(line.split(":", 1)[1].strip())
+                elif ":" in line and not line.startswith("Overall"):
+                    key, value = line.split(":", 1)
+                    category_metrics[key.strip()] = float(value.strip())
+    
+    # Log final best metrics to wandb
+    final_metrics = {
+        "best/overall_accuracy": qa_eval_callback.best_accuracy,
+        "best/epoch": best_epoch if best_epoch is not None else 0,
+    }
+    
+    # Add category-specific metrics
+    for category, value in category_metrics.items():
+        final_metrics[f"best/{category}_accuracy"] = value
+    
+    # Log all final metrics to wandb
+    wandb.log(final_metrics)
+    
+    
 if __name__ == "__main__":
     main()
