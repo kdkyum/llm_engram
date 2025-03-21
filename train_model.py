@@ -369,7 +369,12 @@ def main():
         mcq_type = "withBioS" if args.mcq_with_bios else "noBioS"
         mcq_suffix = f"-mcq{args.mcq_percentage}p-{mcq_type}"
     
-    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}{quantization_suffix}")
+    # Calculate effective batch size for the model path
+    n_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    effective_batch_size = args.per_device_train_batch_size * n_devices * args.gradient_accumulation_steps
+    
+    # Include effective batch size in output directory name
+    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}{quantization_suffix}")
     os.makedirs(output_dir, exist_ok=True)
     
     # Initialize wandb with descriptive run name
@@ -381,7 +386,8 @@ def main():
         mcq_type = "withBioS" if args.mcq_with_bios else "noBioS"
         mcq_run_suffix = f"-mcq{args.mcq_percentage}p-{mcq_type}"
     
-    run_name = args.wandb_run_name or f"{model_name_safe}-{args.bio_field}{mcq_run_suffix}{'-' + quantization_desc if quantization_desc else ''}"
+    # Include effective batch size in wandb run name
+    run_name = args.wandb_run_name or f"{model_name_safe}-{args.bio_field}{mcq_run_suffix}-bs{effective_batch_size}{'-' + quantization_desc if quantization_desc else ''}"
     wandb.init(
         project=args.wandb_project,
         name=run_name,
@@ -427,10 +433,7 @@ def main():
     print(f"Loading {args.model_type} model: {args.model_name_or_path}...")
     
     # Load tokenizer 
-    if args.model_type == "gpt2":
-        tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path, add_bos_token=True)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     
     # Ensure pad token is set
     if tokenizer.pad_token is None:
@@ -605,8 +608,9 @@ def main():
     print("n_devices:", n_devices)
     effective_batch_size = args.per_device_train_batch_size * n_devices * args.gradient_accumulation_steps
     total_steps = (len(tokenized_train) // effective_batch_size) * args.num_train_epochs
-    warmup_steps = int(total_steps * 0.05)
+    warmup_steps = int(total_steps * 0.1)
     print(f"Total training steps: {total_steps}, Warmup steps (5%): {warmup_steps}")
+    print(f"Effective batch size: {effective_batch_size}")
     
     # Configure training with updated mixed precision settings
     training_args = TrainingArguments(
@@ -619,6 +623,9 @@ def main():
         save_strategy="no",  # Don't save model automatically
         eval_strategy="no",  # We'll do our own evaluation with the callback
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        weight_decay=0.1,
         report_to="wandb",
         gradient_checkpointing=args.gradient_checkpointing,
         warmup_steps=warmup_steps,

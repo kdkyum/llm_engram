@@ -1,0 +1,17 @@
+{
+  "bf16": {
+    "enabled": true
+  },
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {
+      "device": "cpu"
+    },
+    "offload_param": {
+      "device": "cpu"
+    }
+  },
+  "gradient_clipping": 1.0,
+  "steps_per_print": 2000,
+  "wall_clock_breakdown": false
+}
