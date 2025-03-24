@@ -2,6 +2,17 @@
 
 This repository contains code for fine-tuning various language models on synthetic personal biography datasets (bioS) and evaluating their performance on question-answering tasks to assess their ability to encode and recall factual information.
 
+## Table of Contents
+- [Supported Models](#supported-models)
+- [Setup](#setup)
+- [Dataset](#dataset)
+- [Training](#training)
+- [Evaluation](#evaluation)
+- [QA Measurement Approach](#qa-measurement-approach)
+- [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Supported Models
 
 - GPT-2 (small, medium, large, xl)
@@ -157,4 +168,36 @@ For a more thorough standalone evaluation after training:
 
 ```bash
 python evaluate_qa.py --model_path ./gpt2-xl-bios/best_model_qa_0.xxxx --num_samples 1000
+```
+
+## Project Structure
+
+```
+llm_engram/
+├── train.py                # Main script for fine-tuning a single model
+├── train_all_models.py     # Script for training multiple models in sequence
+├── evaluate_qa.py          # Evaluation script for a single model
+├── run_multi_model_eval.py # Script for evaluating multiple models
+├── results/                # Directory for evaluation results
+└── model-output/           # Directory for trained model checkpoints
+```
+
+## Reproducing Results
+
+To reproduce the results from our experiments:
+
+1. Fine-tune models using the training scripts with appropriate parameters
+2. Evaluate the models using the evaluation scripts
+3. Results will be saved to the specified output directory
+
+Example workflow:
+```bash
+# Train a model
+python train.py --model_name_or_path gpt2-xl --model_type gpt2 --num_train_epochs 3 --output_dir ./model-output/gpt2-xl-bioS
+
+# Evaluate the trained model
+python evaluate_qa.py --model_path ./model-output/gpt2-xl-bioS --model_type gpt2 --num_samples 1000
+
+# Evaluate multiple models
+python run_multi_model_eval.py --num_samples 1000 --results_dir ./results
 ```
