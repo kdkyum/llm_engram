@@ -7,6 +7,7 @@ import copy
 import numpy as np
 from datasets import load_dataset
 import torch
+from torch.nn.parallel import DataParallel
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer,
@@ -16,13 +17,13 @@ from transformers import (
     Trainer,
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig,
-    AdamW,
 )
 import wandb
 from tqdm import tqdm
 
 # Import QA evaluation function from evaluate_qa.py
 from evaluate_qa import create_multiple_choice_prompt, score_answers, QA_FIELDS
+from helpers.offline_helpers import setup_offline_mode
 
 # Import TrainerCallback for QA evaluation
 from transformers import TrainerCallback
@@ -306,14 +307,10 @@ class BioDataset(torch.utils.data.Dataset):
             truncation=True,
             max_length=self.max_length,
             padding="max_length",
-            return_tensors=None  # Don't convert to tensors yet
+            return_tensors=None
         )
         
-        # Convert input_ids to tensors to catch any issues early
         input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
-        
-        # Create labels for causal LM (same as input_ids)
         inputs["labels"] = input_ids.copy()
         
         return inputs
@@ -342,15 +339,18 @@ def parse_args():
     parser.add_argument("--freeze_embeddings", action="store_true", help="Freeze model embeddings")
     parser.add_argument("--fp16", action="store_true", help="Enable mixed precision training")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing")
-    parser.add_argument("--load_in_8bit", action="store_true", help="Enable 8-bit quantization for large models")
     parser.add_argument("--mcq_percentage", type=int, default=0, help="Percentage of MCQ evaluation examples to include in training data (0-100)")
     parser.add_argument("--mcq_with_bios", action="store_true", help="Include bioS text with MCQ examples (if not set, only MCQ text is used)")
     parser.add_argument("--shuffle_eval_choices", action="store_true", help="Shuffle MCQ choices during evaluation to test for overfitting")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
+    parser.add_argument("--offline", action="store_true", help="Run in offline mode without syncing to wandb")
     return parser.parse_args()
 
 def main():
     args = parse_args()
+
+    if args.offline:
+        setup_offline_mode()
     
     # Set random seed for reproducibility
     random.seed(args.seed)
@@ -361,7 +361,6 @@ def main():
     
     # Configure model output directory to include model name and training settings
     model_name_safe = args.model_name_or_path.replace("/", "-")
-    quantization_suffix = "-8bit" if args.load_in_8bit else ""
     
     # Add MCQ info to output directory if MCQ examples are used
     mcq_suffix = ""
@@ -374,11 +373,10 @@ def main():
     effective_batch_size = args.per_device_train_batch_size * n_devices * args.gradient_accumulation_steps
     
     # Include effective batch size in output directory name
-    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}{quantization_suffix}")
+    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}")
+    args.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
     
-    # Initialize wandb with descriptive run name
-    quantization_desc = "8bit" if args.load_in_8bit else ""
     
     # Add MCQ info to run name if MCQ examples are used
     mcq_run_suffix = ""
@@ -387,7 +385,7 @@ def main():
         mcq_run_suffix = f"-mcq{args.mcq_percentage}p-{mcq_type}"
     
     # Include effective batch size in wandb run name
-    run_name = args.wandb_run_name or f"{model_name_safe}-{args.bio_field}{mcq_run_suffix}-bs{effective_batch_size}{'-' + quantization_desc if quantization_desc else ''}"
+    run_name = args.wandb_run_name or f"{model_name_safe}-{args.bio_field}{mcq_run_suffix}-bs{effective_batch_size}"
     wandb.init(
         project=args.wandb_project,
         name=run_name,
@@ -439,19 +437,6 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Configure quantization if requested
-    quantization_config = None
-    if args.load_in_8bit:
-        print("Using 8-bit quantization...")
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-        )
-    
-    # Import PEFT for parameter-efficient fine-tuning
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
-    
     # Load model with appropriate configuration
     if args.model_type == "gpt2":
         model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
@@ -460,30 +445,8 @@ def main():
             args.model_name_or_path, 
             device_map="auto",
             use_cache=False,
-            quantization_config=quantization_config,
-            # Change dtype based on model type and fp16 flag (only if not using quantization)
-            torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] and not args.load_in_8bit else torch.float32
+            torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] else torch.float32
         )
-    
-    # model.to("cuda")z
-    
-    # For quantized models, we need to use LoRA
-    if args.load_in_8bit:
-        print("Setting up LoRA for quantized model...")
-        # Prepare model for k-bit training
-        model = prepare_model_for_kbit_training(model)
-        
-        # Define LoRA config
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=8,  # Rank
-            lora_alpha=32,
-            lora_dropout=0.1,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        )
-        
-        # Apply LoRA to model
-        model = get_peft_model(model, lora_config)
     
     if args.freeze_embeddings:
         print("Freezing model embeddings...")
@@ -500,36 +463,32 @@ def main():
             for param in model.embed_out.parameters():
                 param.requires_grad = False
         elif args.model_type == "llama":
-            # Skip for LoRA models since we don't need to freeze embeddings
-            if args.load_in_8bit:
-                print("Skipping embedding freezing for LoRA-enabled model")
+            print("Model structure for debugging:")
+            for name, _ in model.named_modules():
+                if "embed" in name:
+                    print(f"Found module: {name}")
+            # Try different paths for embeddings based on model structure
+            if hasattr(model, "base_model"):
+                if hasattr(model.base_model, "embed_tokens"):
+                    for param in model.base_model.embed_tokens.parameters():
+                        param.requires_grad = False
+                    print("Froze embeddings at model.base_model.embed_tokens")
+                elif hasattr(model.base_model, "model") and hasattr(model.base_model.model, "embed_tokens"):
+                    for param in model.base_model.model.embed_tokens.parameters():
+                        param.requires_grad = False
+                    print("Froze embeddings at model.base_model.model.embed_tokens")
+            elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                for param in model.model.embed_tokens.parameters():
+                    param.requires_grad = False
+                print("Froze embeddings at model.model.embed_tokens")
             else:
-                print("Model structure for debugging:")
-                for name, _ in model.named_modules():
-                    if "embed" in name:
-                        print(f"Found module: {name}")
-                # Try different paths for embeddings based on model structure
-                if hasattr(model, "base_model"):
-                    if hasattr(model.base_model, "embed_tokens"):
-                        for param in model.base_model.embed_tokens.parameters():
-                            param.requires_grad = False
-                        print("Froze embeddings at model.base_model.embed_tokens")
-                    elif hasattr(model.base_model, "model") and hasattr(model.base_model.model, "embed_tokens"):
-                        for param in model.base_model.model.embed_tokens.parameters():
-                            param.requires_grad = False
-                        print("Froze embeddings at model.base_model.model.embed_tokens")
-                elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                    for param in model.model.embed_tokens.parameters():
-                        param.requires_grad = False
-                    print("Froze embeddings at model.model.embed_tokens")
-                else:
-                    print("Warning: Could not find embedding layer for Llama model")
-                
-                # Freeze LM head if it exists
-                if hasattr(model, "lm_head"):
-                    for param in model.lm_head.parameters():
-                        param.requires_grad = False
-                    print("Froze lm_head layer")
+                print("Warning: Could not find embedding layer for Llama model")
+            
+            # Freeze LM head if it exists
+            if hasattr(model, "lm_head"):
+                for param in model.lm_head.parameters():
+                    param.requires_grad = False
+                print("Froze lm_head layer")
         elif args.model_type == "gpt2":
             for param in model.transformer.wte.parameters():
                 param.requires_grad = False
@@ -557,23 +516,19 @@ def main():
             if args.model_type == "gpt-j":
                 model.transformer.wte.register_forward_hook(embedding_forward_hook)
             elif args.model_type == "llama":
-                # Skip for LoRA models since embedding handling is different
-                if args.load_in_8bit:
-                    print("Skipping embedding hook for LoRA-enabled model")
+                # Try different paths for embeddings based on model structure
+                if hasattr(model, "base_model"):
+                    if hasattr(model.base_model, "embed_tokens"):
+                        model.base_model.embed_tokens.register_forward_hook(embedding_forward_hook)
+                        print("Registered hook at model.base_model.embed_tokens")
+                    elif hasattr(model.base_model, "model") and hasattr(model.base_model.model, "embed_tokens"):
+                        model.base_model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
+                        print("Registered hook at model.base_model.model.embed_tokens")
+                elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                    model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
+                    print("Registered hook at model.model.embed_tokens")
                 else:
-                    # Try different paths for embeddings based on model structure
-                    if hasattr(model, "base_model"):
-                        if hasattr(model.base_model, "embed_tokens"):
-                            model.base_model.embed_tokens.register_forward_hook(embedding_forward_hook)
-                            print("Registered hook at model.base_model.embed_tokens")
-                        elif hasattr(model.base_model, "model") and hasattr(model.base_model.model, "embed_tokens"):
-                            model.base_model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
-                            print("Registered hook at model.base_model.model.embed_tokens")
-                    elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                        model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
-                        print("Registered hook at model.model.embed_tokens")
-                    else:
-                        print("Warning: Could not find embedding layer for hook in Llama model")
+                    print("Warning: Could not find embedding layer for hook in Llama model")
             elif args.model_type == "gpt2":
                 model.transformer.wte.register_forward_hook(embedding_forward_hook)
             elif args.model_type == "gpt-neox":
@@ -629,13 +584,12 @@ def main():
         report_to="wandb",
         gradient_checkpointing=args.gradient_checkpointing,
         warmup_steps=warmup_steps,
-        fp16=args.fp16 and args.model_type == "gpt2" and not args.load_in_8bit,  # Use fp16 only for gpt2
-        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] and not args.load_in_8bit,  # Use bf16 for llama, gpt-j, and gpt-neox
+        fp16=args.fp16 and args.model_type == "gpt2", # Use fp16 only for gpt2
+        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"], # Use bf16 for llama, gpt-j, and gpt-neox
         half_precision_backend="auto",
         # deepspeed="ds_config.json" if args.model_type in ["llama", "gpt-j", "gpt-neox"] else None
     )
             
-    # Create a custom data collator
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False  # Set to False for causal LM (not masked LM)

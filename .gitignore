@@ -1,4 +1,6 @@
 # Python
+prepare_data.py
+.github/
 output_plots*/
 __pycache__/
 *.py[cod]

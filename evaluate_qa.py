@@ -51,7 +51,7 @@ def parse_args():
 
 def create_multiple_choice_prompt(question, correct_answer, dataset, a_field, with_fewshot=True):
     """Create a multiple-choice prompt where the model should respond with the actual answer."""
-    options = [" A", " B", " C", " D"]
+    options = ["A", "B", "C", "D"]
     
     all_field_answers = precomputed_answers[a_field]
         
