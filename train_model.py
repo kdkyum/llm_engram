@@ -38,25 +38,17 @@ def get_device_fix_patch():
         """
         import torch.nn.functional as F
         
-        # Move num_items_in_batch to the device of the loss tensor
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = shift_labels[..., 1:].contiguous()
-        
         # Get target device from logits
-        target_device = shift_logits.device
-        
-        loss = F.cross_entropy(
-            shift_logits.view(-1, logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=ignore_index,
-            reduction="sum",
-        )
+        target_device = logits.device
+        reduction = "sum" if num_items_in_batch is not None else "mean"
+        loss = F.cross_entropy(logits, shift_labels, ignore_index=ignore_index, reduction=reduction)
         
         # Move num_items_in_batch to the device of loss if it's a tensor
         if isinstance(num_items_in_batch, torch.Tensor):
             num_items_in_batch = num_items_in_batch.to(target_device)
-        
-        loss = loss / num_items_in_batch
+
+        if reduction == "sum":
+            loss = loss / num_items_in_batch
         return loss
     
     # Patch the function
@@ -404,7 +396,7 @@ def main():
     effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
     
     # Include effective batch size in output directory name
-    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}")
+    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}-samples{args.max_samples}-lr{args.learning_rate}-seed{args.seed}")
     args.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
     
@@ -588,11 +580,8 @@ def main():
     )
 
     # Calculate total training steps considering multiple devices
-    n_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    print("n_devices:", n_devices)
-    effective_batch_size = args.per_device_train_batch_size * n_devices * args.gradient_accumulation_steps
     total_steps = (len(tokenized_train) // effective_batch_size) * args.num_train_epochs
-    warmup_steps = int(total_steps * 0.1)
+    warmup_steps = int(total_steps * 0.05)
     print(f"Total training steps: {total_steps}, Warmup steps (5%): {warmup_steps}")
     print(f"Effective batch size: {effective_batch_size}")
     
