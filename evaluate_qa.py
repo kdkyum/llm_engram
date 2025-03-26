@@ -7,6 +7,7 @@ import os
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+from rouge_score import rouge_scorer
 
 QA_FIELDS = [
     ("bdate_q", "bdate_a"),
@@ -47,9 +48,80 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     parser.add_argument("--fp16", action="store_true", help="Use mixed precision for evaluation")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
+    parser.add_argument("--eval_format", type=str, default="both", choices=["option", "direct", "both"], 
+                        help="Evaluation format: option-based, direct answer, or both")
     return parser.parse_args()
 
 def create_multiple_choice_prompt(question, correct_answer, dataset, a_field, with_fewshot=True):
+    """Create a multiple-choice prompt where the model should respond with the option number."""
+    options = ["1", "2", "3", "4"]
+    
+    all_field_answers = precomputed_answers[a_field]
+        
+    # Filter out the correct answer
+    available_options = [a for a in all_field_answers if a != correct_answer]
+    
+    random.shuffle(available_options)
+    
+    # Take first 3 as incorrect answers
+    incorrect_answers = available_options[:3]
+    
+    # If we somehow don't have enough options, fall back to old method
+    if len(incorrect_answers) < 3:
+        print(f"Warning: Not enough unique answers for {a_field}, using fallback method")
+        # Fallback to original implementation
+        incorrect_answers = []
+        while len(incorrect_answers) < 3:
+            random_idx = random.randint(0, len(dataset) - 1)
+            random_answer = dataset[random_idx][a_field]
+            if random_answer != correct_answer and random_answer not in incorrect_answers:
+                incorrect_answers.append(random_answer)
+   
+    # Create choices list with the correct answer at a random position
+    choices = incorrect_answers.copy()
+    correct_idx = random.randint(0, 3)
+    choices.insert(correct_idx, correct_answer)
+    
+    # Updated few-shot examples to demonstrate direct answer format
+    few_shot_examples = """Example 1:
+When was Will Smith born?
+1. January 8, 1987
+2. April 23, 1975
+3. June 12, 1990
+4. September 25, 1968
+Answer: 4. September 25, 1968
+
+Example 2:
+Where was Cameron Diaz born?
+1. Chicago, Illinois
+2. Portland, Oregon
+3. San Diego, California
+4. Seattle, Washington
+Answer: 3. San Diego, California
+
+Example 3:
+What company does Sergey Brin work for?
+1. Microsoft
+2. Google
+3. Amazon
+4. Apple
+Answer: 2. Google
+
+Example 4:
+"""
+    if with_fewshot:
+        prompt = few_shot_examples + f"{question}\n"
+    else:
+        prompt = f"{question}\n"
+        
+    # Add the choices
+    for i, (option, choice) in enumerate(zip(options, choices)):
+        prompt += f"{option}. {choice}\n"
+    prompt += "Answer:"
+
+    return prompt, options[correct_idx]   # Return the answer option letter
+
+def create_direct_answer_prompt(question, correct_answer, dataset, a_field, with_fewshot=True):
     """Create a multiple-choice prompt where the model should respond with the actual answer."""
     options = ["A", "B", "C", "D"]
     
@@ -82,26 +154,26 @@ def create_multiple_choice_prompt(question, correct_answer, dataset, a_field, wi
     # Updated few-shot examples to demonstrate direct answer format
     few_shot_examples = """Example 1:
 When was Will Smith born?
- A. January 8, 1987
- B. April 23, 1975
- C. June 12, 1990
- D. September 25, 1968
+1. January 8, 1987
+2. April 23, 1975
+3. June 12, 1990
+4. September 25, 1968
 Answer: September 25, 1968
 
 Example 2:
 Where was Cameron Diaz born?
- A. Chicago, Illinois
- B. Portland, Oregon
- C. San Diego, California
- D. Seattle, Washington
+1. Chicago, Illinois
+2. Portland, Oregon
+3. San Diego, California
+4. Seattle, Washington
 Answer: San Diego, California
 
 Example 3:
 What company does Sergey Brin work for?
- A. Microsoft
- B. Google
- C. Amazon
- D. Apple
+1. Microsoft
+2. Google
+3. Amazon
+4. Apple
 Answer: Google
 
 Example 4:
@@ -119,12 +191,81 @@ Example 4:
     return prompt, correct_answer  # Return the actual answer, not the option letter
 
 def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, debug=False):
+    """Score the model's accuracy on multiple-choice questions by comparing logits of candidate options."""
+    if not prompts_and_answers:
+        return 0
+    
+    correct = 0
+    total = len(prompts_and_answers)
+    options = ["1", "2", "3", "4"]
+
+    is_llama_tokenizer = len(tokenizer.encode(" 1", add_special_tokens=False)) > 1
+
+    if not is_llama_tokenizer:
+        options = [" 1", " 2", " 3", " 4"]
+
+    option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[-1] for opt in options]
+    
+    # Process in batches
+    for i in tqdm(range(0, total, batch_size)):
+        if is_llama_tokenizer:
+            batch_prompts = [p[0] + " " for p in prompts_and_answers[i:i+batch_size]]
+        else:
+            batch_prompts = [p[0] for p in prompts_and_answers[i:i+batch_size]]
+        batch_answers = [p[1] for p in prompts_and_answers[i:i+batch_size]]
+        
+        # Tokenize all prompts in the batch
+        batch_inputs = tokenizer(batch_prompts, padding=True, return_tensors="pt").to(device)
+        
+        # Debug: print a sample prompt
+        if debug and i == 0:
+            print("\n=== DEBUG: Sample QA prompt (option-based) ===")
+            sample_prompt = tokenizer.decode(batch_inputs['input_ids'][0])
+            print(f"Prompt: {sample_prompt}")
+            print(f"Correct answer: {batch_answers[0]}")
+
+        # Forward pass to get logits
+        with torch.no_grad():
+            outputs = model(batch_inputs.input_ids, attention_mask=batch_inputs.attention_mask)
+            logits = outputs.logits
+        
+        # For each example in batch, get the option with highest probability
+        for j, (logit, correct_answer) in enumerate(zip(logits, batch_answers)):
+            # Get the last token logits (for the position right after "Answer:")
+            last_token_logits = logit[-1, :]
+            
+            # Get probabilities for each option token
+            option_probs = {opt: last_token_logits[token_id].item() for opt, token_id in zip(options, option_token_ids)}
+            
+            # Get the option with the highest probability
+            predicted_option = max(option_probs.items(), key=lambda x: x[1])[0]
+            
+            is_correct = (predicted_option == correct_answer)
+            
+            if is_correct:
+                correct += 1
+            
+            # Debug: print prediction details
+            if debug:
+                print(f"\n=== DEBUG: Prediction for example {i*batch_size + j} ===")
+                print(f"Prompt ending: ...{batch_prompts[j][-50:]}")
+                print(f"Option logits: {option_probs}")
+                print(f"Predicted option: {predicted_option}")
+                print(f"Correct option: {correct_answer}")
+                print(f"Correct? {'✓' if is_correct else '✗'}")
+                print("-" * 50)
+    
+    accuracy = correct / total
+    return accuracy
+
+def score_direct_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, debug=False):
     """Score the model's accuracy on multiple-choice questions using direct answer generation."""
     if not prompts_and_answers:
         return 0
     
     correct = 0
     total = len(prompts_and_answers)
+    scorer = rouge_scorer.RougeScorer(['rouge1'], use_stemmer=True)
     
     # Process in batches
     for i in tqdm(range(0, total, batch_size)):
@@ -136,7 +277,7 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
         
         # Debug: print a sample prompt
         if debug and i == 0:
-            print("\n=== DEBUG: Sample QA prompt ===")
+            print("\n=== DEBUG: Sample QA prompt (direct answer) ===")
             sample_prompt = tokenizer.decode(batch_inputs['input_ids'][0])
             print(f"Prompt: {sample_prompt}")
             print(f"Correct answer: {batch_answers[0]}")
@@ -166,18 +307,20 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
             # Normalize both for comparison
             gen_norm = generated_answer.lower().strip()
             correct_norm = correct_answer.lower().strip()
+            scores = scorer.score(correct_norm, gen_norm)
             
             # Check for match or partial match (answer might be cut off)
             is_correct = (gen_norm == correct_norm or 
                          gen_norm.startswith(correct_norm) or 
-                         correct_norm.startswith(gen_norm))
+                         correct_norm.startswith(gen_norm) or
+                         scores['rouge1'].fmeasure > 0.9)
             
             if is_correct:
                 correct += 1
             
             # Debug: print prediction details
             if debug:
-                print(f"\n=== DEBUG: Prediction for example {i*batch_size + j} ===")
+                print(f"\n=== DEBUG: Direct Answer Prediction for example {i*batch_size + j} ===")
                 print(f"Prompt ending: ...{batch_prompts[j][-50:]}")  # Last part of prompt
                 print(f"Generated text: '{generated_text}'")
                 print(f"Extracted answer: '{generated_answer}'")
@@ -185,6 +328,8 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
                 print(f"Correct answer: '{correct_answer}'")
                 print(f"Normalized correct: '{correct_norm}'")
                 print(f"Correct? {'✓' if is_correct else '✗'}")
+                print(f"ROUGE-1: {scores['rouge1'].fmeasure:.4f}")
+                print(f"")
                 print("-" * 50)
     
     accuracy = correct / total
@@ -192,11 +337,13 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
 
 def evaluate_qa_by_type(model, tokenizer, test_dataset, args):
     """Evaluate QA accuracy by question type with batched processing."""
-    results = {}
-    overall_prompts = []
+    # Results dictionaries for both formats
+    option_results = {}
+    direct_results = {}
     
-    # Collect prompts and answers for each QA type
-    qa_type_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
+    # Collect prompts and answers for each QA type, for both formats
+    qa_type_option_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
+    qa_type_direct_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
     
     # Debug: print an example record from test dataset
     if args.debug and len(test_dataset) > 0:
@@ -208,53 +355,107 @@ def evaluate_qa_by_type(model, tokenizer, test_dataset, args):
             if field.endswith("_q") or field.endswith("_a"):
                 print(f"{field}: {value}")
     
+    # Determine which evaluation formats to use
+    eval_option = args.eval_format in ["option", "both"]
+    eval_direct = args.eval_format in ["direct", "both"]
+    
+    # Generate prompts for both evaluation formats
     for i in range(min(args.num_samples, len(test_dataset))):
         for q_field, a_field in QA_FIELDS:
             question = test_dataset[i][q_field]
             correct_answer = test_dataset[i][a_field]
             
-            prompt, correct_option = create_multiple_choice_prompt(
-                question, correct_answer, test_dataset, a_field
-            )
+            # Create prompts for both formats if needed
+            if eval_option:
+                option_prompt, option_correct = create_multiple_choice_prompt(
+                    question, correct_answer, test_dataset, a_field
+                )
+                if option_prompt and option_correct:
+                    qa_type_option_prompts[q_field].append((option_prompt, option_correct))
             
-            if prompt and correct_option:
-                qa_type_prompts[q_field].append((prompt, correct_option))
+            if eval_direct:
+                direct_prompt, direct_correct = create_direct_answer_prompt(
+                    question, correct_answer, test_dataset, a_field
+                )
+                if direct_prompt and direct_correct:
+                    qa_type_direct_prompts[q_field].append((direct_prompt, direct_correct))
     
     # Debug: print count of examples per question type
     if args.debug:
         print("\n=== DEBUG: Number of examples per question type ===")
-        for q_field, prompts in qa_type_prompts.items():
-            print(f"{q_field}: {len(prompts)} examples")
+        for q_field in qa_type_option_prompts:
+            if eval_option:
+                print(f"{q_field} (option format): {len(qa_type_option_prompts[q_field])} examples")
+            if eval_direct:
+                print(f"{q_field} (direct format): {len(qa_type_direct_prompts[q_field])} examples")
     
-    # Calculate accuracy for each QA type using batched processing
-    total_correct = 0
-    total_samples = 0
-    
-    for q_field, prompts_and_answers in qa_type_prompts.items():
-        print(f"Evaluating {q_field} questions...")
+    # Evaluate option-based format
+    if eval_option:
+        print("\n==== Evaluating OPTION-BASED Format ====")
+        option_total_correct = 0
+        option_total_samples = 0
         
-        # Print debug info for the first QA type only if in debug mode
-        qa_debug = args.debug and q_field == QA_FIELDS[0][0]
+        for q_field, prompts_and_answers in qa_type_option_prompts.items():
+            print(f"Evaluating {q_field} questions (option-based)...")
+            
+            # Print debug info for the first QA type only if in debug mode
+            qa_debug = args.debug and q_field == QA_FIELDS[0][0]
+            
+            accuracy = score_answers(
+                model, 
+                tokenizer, 
+                prompts_and_answers, 
+                args.device, 
+                batch_size=args.batch_size,
+                debug=qa_debug
+            )
+            option_results[q_field] = accuracy
+            print(f"{q_field} accuracy: {accuracy:.4f}")
+            
+            # Accumulate totals for overall accuracy
+            option_total_correct += accuracy * len(prompts_and_answers)
+            option_total_samples += len(prompts_and_answers)
         
-        accuracy = score_answers(
-            model, 
-            tokenizer, 
-            prompts_and_answers, 
-            args.device, 
-            batch_size=args.batch_size,
-            debug=qa_debug
-        )
-        results[q_field] = accuracy
-        print(f"{q_field} accuracy: {accuracy:.4f}")
+        # Calculate overall accuracy from accumulated totals
+        option_results["overall"] = option_total_correct / option_total_samples if option_total_samples > 0 else 0
+    
+    # Evaluate direct answer format
+    if eval_direct:
+        print("\n==== Evaluating DIRECT ANSWER Format ====")
+        direct_total_correct = 0
+        direct_total_samples = 0
         
-        # Accumulate totals for overall accuracy
-        total_correct += accuracy * len(prompts_and_answers)
-        total_samples += len(prompts_and_answers)
+        for q_field, prompts_and_answers in qa_type_direct_prompts.items():
+            print(f"Evaluating {q_field} questions (direct answer)...")
+            
+            # Print debug info for the first QA type only if in debug mode
+            qa_debug = args.debug and q_field == QA_FIELDS[0][0]
+            
+            accuracy = score_direct_answers(
+                model, 
+                tokenizer, 
+                prompts_and_answers, 
+                args.device, 
+                batch_size=args.batch_size,
+                debug=qa_debug
+            )
+            direct_results[q_field] = accuracy
+            print(f"{q_field} accuracy: {accuracy:.4f}")
+            
+            # Accumulate totals for overall accuracy
+            direct_total_correct += accuracy * len(prompts_and_answers)
+            direct_total_samples += len(prompts_and_answers)
+        
+        # Calculate overall accuracy from accumulated totals
+        direct_results["overall"] = direct_total_correct / direct_total_samples if direct_total_samples > 0 else 0
     
-    # Calculate overall accuracy from accumulated totals
-    results["overall"] = total_correct / total_samples
+    # Combine results for return
+    combined_results = {
+        "option": option_results,
+        "direct": direct_results
+    }
     
-    return results
+    return combined_results
 
 def main():
     args = parse_args()
@@ -287,6 +488,7 @@ def main():
     
     # Make this available for MCQ generation
     create_multiple_choice_prompt.all_answers_by_field = all_answers_by_field
+    create_direct_answer_prompt.all_answers_by_field = all_answers_by_field
     
     # Load the model and tokenizer based on model type
     print(f"Loading model from {args.model_path}...")
@@ -345,20 +547,27 @@ def main():
     print(f"Model name: {args.model_path}")
     print(f"Device: {args.device}")
     print(f"FP16: {args.fp16}")
+    print(f"Evaluation format: {args.eval_format}")
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
     
     # Evaluate the model
     print(f"Evaluating model on {args.num_samples} samples...")
-    results = evaluate_qa_by_type(model, tokenizer, test_dataset, args)
+    combined_results = evaluate_qa_by_type(model, tokenizer, test_dataset, args)
     
     # Print overall results
-    print("\n===== RESULTS =====")
-    for question_type, accuracy in results.items():
-        print(f"{question_type}: {accuracy:.4f}")
+    if "option" in combined_results and combined_results["option"]:
+        print("\n===== OPTION-BASED FORMAT RESULTS =====")
+        for question_type, accuracy in combined_results["option"].items():
+            print(f"{question_type}: {accuracy:.4f}")
+        print(f"\nOption-Based Overall Accuracy: {combined_results['option']['overall']:.4f}")
     
-    print(f"\nOverall Accuracy: {results['overall']:.4f}")
+    if "direct" in combined_results and combined_results["direct"]:
+        print("\n===== DIRECT ANSWER FORMAT RESULTS =====")
+        for question_type, accuracy in combined_results["direct"].items():
+            print(f"{question_type}: {accuracy:.4f}")
+        print(f"\nDirect Answer Overall Accuracy: {combined_results['direct']['overall']:.4f}")
 
 if __name__ == "__main__":
     main()

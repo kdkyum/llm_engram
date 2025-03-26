@@ -16,8 +16,12 @@ from transformers import (
 import wandb
 from tqdm import tqdm
 
-# Import QA evaluation function from evaluate_qa.py
-from evaluate_qa import create_multiple_choice_prompt, score_answers, QA_FIELDS
+# Import QA evaluation functions from evaluate_qa.py
+from evaluate_qa import (
+    create_multiple_choice_prompt, score_answers, 
+    create_direct_answer_prompt, score_direct_answers, 
+    QA_FIELDS
+)
 
 # Import TrainerCallback for QA evaluation
 from transformers import TrainerCallback
@@ -64,7 +68,15 @@ class QAEvaluationCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.args = args
         self.eval_steps = 0
-        self.best_accuracy = 0.0
+        
+        # Track best scores for both evaluation formats
+        self.best_option_accuracy = 0.0
+        self.best_direct_accuracy = 0.0
+        
+        # Determine which format to use for the primary best model
+        self.primary_format = args.primary_eval_format
+        
+        # Create directory for best model (only keep one best model based on primary format)
         self.best_model_path = os.path.join(args.output_dir, "best_model")
         os.makedirs(self.best_model_path, exist_ok=True)
 
@@ -93,47 +105,109 @@ class QAEvaluationCallback(TrainerCallback):
             print(f"Evaluating model on {eval_samples} samples...")
             qa_results = self.evaluate_qa(model, self.tokenizer, self.eval_dataset, self.args)
             
-            # Check if this is the best model so far
-            current_accuracy = qa_results["overall"]
-            if current_accuracy > self.best_accuracy:
-                self.best_accuracy = current_accuracy
-                print(f"\n=== New best model found! Accuracy: {current_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+            # Process results for both formats
+            option_results = qa_results["option"]
+            direct_results = qa_results["direct"]
+            
+            # Check if this is the best option-based model (just track scores)
+            if option_results and "overall" in option_results:
+                current_option_accuracy = option_results["overall"]
+                if current_option_accuracy > self.best_option_accuracy:
+                    self.best_option_accuracy = current_option_accuracy
+                    print(f"\n=== New best option accuracy: {current_option_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+            
+            # Check if this is the best direct answer model (just track scores)
+            if direct_results and "overall" in direct_results:
+                current_direct_accuracy = direct_results["overall"]
+                if current_direct_accuracy > self.best_direct_accuracy:
+                    self.best_direct_accuracy = current_direct_accuracy
+                    print(f"\n=== New best direct answer accuracy: {current_direct_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+            
+            # Only save the best model based on the primary evaluation format
+            current_primary_accuracy = option_results["overall"] if self.primary_format == "option" else direct_results["overall"]
+            best_primary_accuracy = self.best_option_accuracy if self.primary_format == "option" else self.best_direct_accuracy
+            current_primary_results = option_results if self.primary_format == "option" else direct_results
+            
+            if current_primary_accuracy == best_primary_accuracy:
+                print(f"\n=== New best model based on {self.primary_format} format! Accuracy: {current_primary_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
                 
                 # Save the best model
                 print(f"Saving best model to {self.best_model_path}")
+                
+                # Save the model and tokenizer
                 self.trainer.save_model(self.best_model_path)
                 self.tokenizer.save_pretrained(self.best_model_path)
                 
                 # Save best model metrics
                 with open(os.path.join(self.best_model_path, "best_metrics.txt"), "w") as f:
+                    f.write(f"Primary format: {self.primary_format}\n")
                     f.write(f"Epoch: {state.epoch:.2f}\n")
                     f.write(f"Step: {state.global_step}\n")
-                    f.write(f"Overall accuracy: {qa_results['overall']:.4f}\n")
-                    for question_type, accuracy in qa_results.items():
+                    f.write(f"Overall accuracy: {current_primary_results['overall']:.4f}\n")
+                    for question_type, accuracy in current_primary_results.items():
                         if question_type != "overall":
                             f.write(f"{question_type}: {accuracy:.4f}\n")
             
             # Log to wandb with eval step to distinguish between evaluations
-            wandb.log({
+            wandb_metrics = {
                 "eval/step": self.eval_steps,
                 "eval/epoch": state.epoch,
-                "eval/qa_overall_accuracy": qa_results["overall"],
-                "eval/qa_bdate_accuracy": qa_results["bdate_q"],
-                "eval/qa_bcity_accuracy": qa_results["bcity_q"],
-                "eval/qa_university_accuracy": qa_results["university_q"],
-                "eval/qa_major_accuracy": qa_results["major_q"],
-                "eval/qa_employer_accuracy": qa_results["employer_q"],
-                "eval/qa_company_city_accuracy": qa_results["company_city_q"],
-                "eval/is_best_model": 1 if current_accuracy == self.best_accuracy else 0,
-            }, step=state.global_step)
+            }
             
-            print(f"\n===== QA EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
-            for question_type, accuracy in qa_results.items():
-                if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics in the print output
-                    print(f"{question_type}: {accuracy:.4f}")
-            print(f"Overall Accuracy: {qa_results['overall']:.4f}")
-            if qa_results["overall"] == self.best_accuracy:
-                print("(Best model so far)")
+            # Add option format metrics
+            if option_results and "overall" in option_results:
+                wandb_metrics.update({
+                    "eval/option_qa_overall_accuracy": option_results["overall"],
+                    "eval/option_qa_bdate_accuracy": option_results["bdate_q"],
+                    "eval/option_qa_bcity_accuracy": option_results["bcity_q"],
+                    "eval/option_qa_university_accuracy": option_results["university_q"],
+                    "eval/option_qa_major_accuracy": option_results["major_q"],
+                    "eval/option_qa_employer_accuracy": option_results["employer_q"],
+                    "eval/option_qa_company_city_accuracy": option_results["company_city_q"],
+                    "eval/option_is_best_model": 1 if option_results["overall"] == self.best_option_accuracy else 0,
+                })
+            
+            # Add direct format metrics
+            if direct_results and "overall" in direct_results:
+                wandb_metrics.update({
+                    "eval/direct_qa_overall_accuracy": direct_results["overall"],
+                    "eval/direct_qa_bdate_accuracy": direct_results["bdate_q"],
+                    "eval/direct_qa_bcity_accuracy": direct_results["bcity_q"],
+                    "eval/direct_qa_university_accuracy": direct_results["university_q"],
+                    "eval/direct_qa_major_accuracy": direct_results["major_q"],
+                    "eval/direct_qa_employer_accuracy": direct_results["employer_q"],
+                    "eval/direct_qa_company_city_accuracy": direct_results["company_city_q"],
+                    "eval/direct_is_best_model": 1 if direct_results["overall"] == self.best_direct_accuracy else 0,
+                })
+            
+            # Add primary format indicator
+            wandb_metrics.update({
+                "eval/primary_format": 0 if self.primary_format == "option" else 1,
+                "eval/primary_best_accuracy": best_primary_accuracy,
+                "eval/saved_best_model": 1 if current_primary_accuracy == best_primary_accuracy else 0
+            })
+            
+            wandb.log(wandb_metrics, step=state.global_step)
+            
+            # Print option format results
+            if option_results and "overall" in option_results:
+                print(f"\n===== OPTION FORMAT EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
+                for question_type, accuracy in option_results.items():
+                    if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics
+                        print(f"{question_type}: {accuracy:.4f}")
+                print(f"Option Format Overall Accuracy: {option_results['overall']:.4f}")
+                if option_results["overall"] == self.best_option_accuracy:
+                    print("(Best option accuracy so far)")
+            
+            # Print direct format results
+            if direct_results and "overall" in direct_results:
+                print(f"\n===== DIRECT ANSWER FORMAT EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
+                for question_type, accuracy in direct_results.items():
+                    if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics
+                        print(f"{question_type}: {accuracy:.4f}")
+                print(f"Direct Answer Format Overall Accuracy: {direct_results['overall']:.4f}")
+                if direct_results["overall"] == self.best_direct_accuracy:
+                    print("(Best direct answer accuracy so far)")
             
         except Exception as e:
             print(f"Error during evaluation: {e}")
@@ -144,9 +218,14 @@ class QAEvaluationCallback(TrainerCallback):
         model.train()
         
     def evaluate_qa(self, model, tokenizer, eval_dataset, args):
-        """Evaluate QA accuracy by question type using batched processing"""
-        results = {}
-        overall_prompts = []
+        """Evaluate QA accuracy by question type using batched processing for both formats"""
+        # Results dictionaries for both formats
+        option_results = {}
+        direct_results = {}
+        
+        # Determine which evaluation formats to use
+        eval_option = args.eval_format in ["option", "both"]
+        eval_direct = args.eval_format in ["direct", "both"]
         
         # Use a subset of eval dataset for faster evaluation during training
         subset_size = min(args.eval_samples, len(eval_dataset))
@@ -156,10 +235,12 @@ class QAEvaluationCallback(TrainerCallback):
         if args.debug:
             print(f"\n=== DEBUG: QA Evaluation ===")
             print(f"Evaluating on {subset_size} samples")
+            print(f"Formats: {'option ' if eval_option else ''}{'direct' if eval_direct else ''}")
             print(f"Device: {model.device}")
         
-        # Collect prompts and answers for each QA type
-        qa_type_prompts = {q_field: [] for q_field, _ in QA_FIELDS}
+        # Collect prompts and answers for each QA type, for both formats
+        qa_type_option_prompts = {q_field: [] for q_field, _ in QA_FIELDS} if eval_option else {}
+        qa_type_direct_prompts = {q_field: [] for q_field, _ in QA_FIELDS} if eval_direct else {}
         
         # First collect all prompts and answers
         for i in indices:
@@ -167,56 +248,97 @@ class QAEvaluationCallback(TrainerCallback):
                 question = eval_dataset[i][q_field]
                 correct_answer = eval_dataset[i][a_field]
                 
-                prompt, correct_option = create_multiple_choice_prompt(
-                    question, correct_answer, eval_dataset, a_field, with_fewshot=True
-                )
-                
-                if prompt and correct_option:
-                    qa_type_prompts[q_field].append((prompt, correct_option))
-                    # Also add to overall prompts for combined score
-                    overall_prompts.append((prompt, correct_option))
+                if eval_option:
+                    # Option-based prompts
+                    option_prompt, option_correct = create_multiple_choice_prompt(
+                        question, correct_answer, eval_dataset, a_field, with_fewshot=True
+                    )
                     
-                    # Debug: Print one example of each question type
-                    if args.debug and len(qa_type_prompts[q_field]) == 1:
-                        print(f"\n=== DEBUG: Example {q_field} Question ===")
-                        print(f"Question: {question}")
-                        print(f"Correct Answer: {correct_answer}")
-                        print(f"Formatted prompt:\n{prompt}")
-                        print(f"Expected option: {correct_option}")
+                    if option_prompt and option_correct:
+                        qa_type_option_prompts[q_field].append((option_prompt, option_correct))
+                
+                if eval_direct:
+                    # Direct answer prompts
+                    direct_prompt, direct_correct = create_direct_answer_prompt(
+                        question, correct_answer, eval_dataset, a_field, with_fewshot=True
+                    )
+                    
+                    if direct_prompt and direct_correct:
+                        qa_type_direct_prompts[q_field].append((direct_prompt, direct_correct))
         
-        # Debug: Print count of examples per question type
+        # Debug: Print count of examples per question type for each format
         if args.debug:
             print("\n=== DEBUG: Number of examples per question type ===")
-            for q_field, prompts in qa_type_prompts.items():
-                print(f"{q_field}: {len(prompts)} examples")
+            if eval_option:
+                for q_field, prompts in qa_type_option_prompts.items():
+                    print(f"{q_field} (option format): {len(prompts)} examples")
+            if eval_direct:
+                for q_field, prompts in qa_type_direct_prompts.items():
+                    print(f"{q_field} (direct format): {len(prompts)} examples")
         
-        # Calculate accuracy for each QA type using batched processing
         device = model.device
-        total_correct = 0
-        total_samples = 0
         
-        for q_field, prompts_and_answers in qa_type_prompts.items():
-            # Only debug the first question type to avoid too much output
-            debug_this_type = args.debug and q_field == QA_FIELDS[0][0]
+        # Calculate accuracy for option-based format
+        if eval_option:
+            option_total_correct = 0
+            option_total_samples = 0
             
-            accuracy = score_answers(
-                model, 
-                tokenizer, 
-                prompts_and_answers, 
-                device, 
-                batch_size=args.eval_batch_size,
-                debug=debug_this_type
-            )
-            results[q_field] = accuracy
+            for q_field, prompts_and_answers in qa_type_option_prompts.items():
+                # Only debug the first question type to avoid too much output
+                debug_this_type = args.debug and q_field == QA_FIELDS[0][0]
+                
+                accuracy = score_answers(
+                    model, 
+                    tokenizer, 
+                    prompts_and_answers, 
+                    device, 
+                    batch_size=args.eval_batch_size,
+                    debug=debug_this_type
+                )
+                option_results[q_field] = accuracy
+                
+                # Add to totals for overall accuracy
+                option_total_correct += accuracy * len(prompts_and_answers)
+                option_total_samples += len(prompts_and_answers)
             
-            # Add to totals for overall accuracy
-            total_correct += accuracy * len(prompts_and_answers)
-            total_samples += len(prompts_and_answers)
+            # Calculate overall accuracy from accumulated results
+            if option_total_samples > 0:
+                option_results["overall"] = option_total_correct / option_total_samples
         
-        # Calculate overall accuracy from accumulated results
-        results["overall"] = total_correct / total_samples if total_samples > 0 else 0
+        # Calculate accuracy for direct answer format
+        if eval_direct:
+            direct_total_correct = 0
+            direct_total_samples = 0
+            
+            for q_field, prompts_and_answers in qa_type_direct_prompts.items():
+                # Only debug the first question type to avoid too much output
+                debug_this_type = args.debug and q_field == QA_FIELDS[0][0]
+                
+                accuracy = score_direct_answers(
+                    model, 
+                    tokenizer, 
+                    prompts_and_answers, 
+                    device, 
+                    batch_size=args.eval_batch_size,
+                    debug=debug_this_type
+                )
+                direct_results[q_field] = accuracy
+                
+                # Add to totals for overall accuracy
+                direct_total_correct += accuracy * len(prompts_and_answers)
+                direct_total_samples += len(prompts_and_answers)
+            
+            # Calculate overall accuracy from accumulated results
+            if direct_total_samples > 0:
+                direct_results["overall"] = direct_total_correct / direct_total_samples
         
-        return results
+        # Combine results for return
+        combined_results = {
+            "option": option_results,
+            "direct": direct_results
+        }
+        
+        return combined_results
 
 
 class BioDataset(torch.utils.data.Dataset):
@@ -371,6 +493,11 @@ def parse_args():
     parser.add_argument("--shuffle_eval_choices", action="store_true", help="Shuffle MCQ choices during evaluation to test for overfitting")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
     parser.add_argument("--offline", action="store_true", help="Run in offline mode without syncing to wandb")
+    # Add new arguments for evaluation format
+    parser.add_argument("--eval_format", type=str, default="both", choices=["option", "direct", "both"], 
+                      help="Evaluation format to use: option-based, direct answer, or both")
+    parser.add_argument("--primary_eval_format", type=str, default="direct", choices=["option", "direct"],
+                      help="Primary evaluation format to use for determining the best model")
     return parser.parse_args()
 
 def main():
@@ -395,19 +522,25 @@ def main():
     n_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
     effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
     
+    # Include evaluation format in output directory name
+    eval_format_suffix = f"-eval{args.primary_eval_format}"
+    
     # Include effective batch size in output directory name
-    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}-samples{args.max_samples}-lr{args.learning_rate}-seed{args.seed}")
+    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}{eval_format_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}-samples{args.max_samples}-lr{args.learning_rate}-seed{args.seed}")
     args.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
     
-    # Add MCQ info to run name if MCQ examples are used
+    # Add MCQ and eval format info to run name
     mcq_run_suffix = ""
     if args.mcq_percentage > 0:
         mcq_type = "withBioS" if args.mcq_with_bios else "noBioS"
         mcq_run_suffix = f"-mcq{args.mcq_percentage}p-{mcq_type}"
     
+    # Include evaluation format in run name
+    eval_format_run_suffix = f"-eval{args.primary_eval_format}"
+    
     # Include effective batch size in wandb run name
-    run_name = args.wandb_run_name or f"{model_name_safe}-{args.bio_field}{mcq_run_suffix}-bs{effective_batch_size}"
+    run_name = args.wandb_run_name or f"{model_name_safe}-{args.bio_field}{mcq_run_suffix}{eval_format_run_suffix}-bs{effective_batch_size}"
     wandb.init(
         project=args.wandb_project,
         name=run_name,
@@ -441,6 +574,7 @@ def main():
         
         # Make this available for MCQ generation
         create_multiple_choice_prompt.all_answers_by_field = all_answers_by_field
+        create_direct_answer_prompt.all_answers_by_field = all_answers_by_field
     else:
         print("Using precomputed answer categories")
     
@@ -639,36 +773,44 @@ def main():
     trainer.train()
 
     # Print best model information
-    print(f"Best model saved at {qa_eval_callback.best_model_path}")
-    print(f"Best accuracy: {qa_eval_callback.best_accuracy:.4f}")
+    print("\n===== TRAINING COMPLETE =====")
+    print(f"Best option accuracy: {qa_eval_callback.best_option_accuracy:.4f}")
+    print(f"Best direct answer accuracy: {qa_eval_callback.best_direct_accuracy:.4f}")
+    print(f"Primary evaluation format: {args.primary_eval_format}")
+    print(f"Best model saved at {qa_eval_callback.best_model_path} (based on {args.primary_eval_format} format)")
     
-    # Load the best model metrics
+    # Log final best metrics to wandb for both formats
+    final_metrics = {
+        "best/option_overall_accuracy": qa_eval_callback.best_option_accuracy,
+        "best/direct_overall_accuracy": qa_eval_callback.best_direct_accuracy,
+        "best/primary_format": 0 if args.primary_eval_format == "option" else 1,
+        "best/primary_accuracy": qa_eval_callback.best_option_accuracy if args.primary_eval_format == "option" else qa_eval_callback.best_direct_accuracy
+    }
+    
+    # Add category-specific metrics for the primary format
     best_metrics_path = os.path.join(qa_eval_callback.best_model_path, "best_metrics.txt")
-    best_epoch = None
-    best_step = None
-    category_metrics = {}
-    
     if os.path.exists(best_metrics_path):
         with open(best_metrics_path, "r") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("Epoch:"):
-                    best_epoch = float(line.split(":", 1)[1].strip())
+                if line.startswith("Primary format:"):
+                    # Store the primary format but don't try to convert to float
+                    final_metrics["best/primary_format_str"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Epoch:"):
+                    final_metrics["best/epoch"] = float(line.split(":", 1)[1].strip())
                 elif line.startswith("Step:"):
-                    best_step = int(line.split(":", 1)[1].strip())
-                elif ":" in line and not line.startswith("Overall"):
+                    final_metrics["best/step"] = int(line.split(":", 1)[1].strip())
+                elif line.startswith("Overall accuracy:"):
+                    final_metrics["best/overall_accuracy"] = float(line.split(":", 1)[1].strip())
+                elif ":" in line:
                     key, value = line.split(":", 1)
-                    category_metrics[key.strip()] = float(value.strip())
-    
-    # Log final best metrics to wandb
-    final_metrics = {
-        "best/overall_accuracy": qa_eval_callback.best_accuracy,
-        "best/epoch": best_epoch if best_epoch is not None else 0,
-    }
-    
-    # Add category-specific metrics
-    for category, value in category_metrics.items():
-        final_metrics[f"best/{category}_accuracy"] = value
+                    key = key.strip()
+                    if key not in ["Primary format"]:  # Skip already processed keys
+                        format_prefix = "option" if args.primary_eval_format == "option" else "direct"
+                        try:
+                            final_metrics[f"best/{format_prefix}_{key}_accuracy"] = float(value.strip())
+                        except ValueError:
+                            print(f"Warning: Could not convert value '{value.strip()}' to float for key '{key}'")
     
     # Log all final metrics to wandb
     wandb.log(final_metrics)

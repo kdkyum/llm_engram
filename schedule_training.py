@@ -169,8 +169,10 @@ def main():
     
     # Define models to train
     models = [
+        {"name": "gpt2-xl", "type": "gpt2", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "eval_batch_size": 1},
+        {"name": "EleutherAI/gpt-j-6B", "type": "gpt-j", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         {"name": "meta-llama/Llama-2-7b-hf", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        # {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         # {"name": "allenai/OLMo-2-1124-7B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         {"name": "meta-llama/Llama-2-13b-hf", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         # {"name": "allenai/OLMo-2-1124-13B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
@@ -182,7 +184,7 @@ def main():
     lr_values = []
     if args.run_lr_sweep:
         # For each model's default LR, create a range of values
-        lr_values.extend([3e-5, 4e-5, 5e-5])
+        lr_values.extend([1e-5, 2e-5, 3e-5, 4e-5, 5e-5])
         # Remove duplicates and sort
         lr_values = sorted(list(set(lr_values)))
     else:
@@ -194,7 +196,7 @@ def main():
     job_queue = []
     
     # Create job configurations for all combinations
-    for model_info in models:
+    for model_info in models[::-1]:
         model_name = model_info["name"]
         
         for bio_field in bio_fields:
