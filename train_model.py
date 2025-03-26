@@ -23,6 +23,46 @@ from evaluate_qa import create_multiple_choice_prompt, score_answers, QA_FIELDS
 from transformers import TrainerCallback
 from helpers.offline_helpers import setup_offline_mode
 
+# Add this function to your script before the main() function
+def get_device_fix_patch():
+    """
+    Monkey patch the fixed_cross_entropy function in transformers to handle multi-device scenarios
+    """
+    from transformers.loss import loss_utils
+    
+    original_fixed_cross_entropy = loss_utils.fixed_cross_entropy
+    
+    def patched_fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs):
+        """
+        Patched version that ensures tensors are on the same device before operations
+        """
+        import torch.nn.functional as F
+        
+        # Move num_items_in_batch to the device of the loss tensor
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = shift_labels[..., 1:].contiguous()
+        
+        # Get target device from logits
+        target_device = shift_logits.device
+        
+        loss = F.cross_entropy(
+            shift_logits.view(-1, logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        
+        # Move num_items_in_batch to the device of loss if it's a tensor
+        if isinstance(num_items_in_batch, torch.Tensor):
+            num_items_in_batch = num_items_in_batch.to(target_device)
+        
+        loss = loss / num_items_in_batch
+        return loss
+    
+    # Patch the function
+    loss_utils.fixed_cross_entropy = patched_fixed_cross_entropy
+
+
 class QAEvaluationCallback(TrainerCallback):
     """Custom callback for QA evaluation during training"""
     
@@ -349,6 +389,7 @@ def main():
     if args.offline:
         setup_offline_mode()
     
+    get_device_fix_patch()
     # Configure model output directory to include model name and training settings
     model_name_safe = args.model_name_or_path.replace("/", "-")
     
@@ -360,7 +401,7 @@ def main():
     
     # Calculate effective batch size for the model path
     n_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    effective_batch_size = args.per_device_train_batch_size * n_devices * args.gradient_accumulation_steps
+    effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
     
     # Include effective batch size in output directory name
     output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}")
@@ -429,7 +470,7 @@ def main():
     # Load model with appropriate configuration
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, 
-        device_map="balanced",
+        device_map="auto",
         use_cache=False,
         # Change dtype based on model type and fp16 flag (only if not using quantization)
         torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] else torch.float32
