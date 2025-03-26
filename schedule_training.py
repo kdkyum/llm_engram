@@ -82,7 +82,7 @@ def create_slurm_script(args, model_info, bio_field, learning_rate, job_id):
         num_train_epochs = args.num_train_epochs
     
     # Build python command for training
-    python_cmd = ["python", # "--nnodes=1", f"--nproc_per_node={num_gpus}", "--master_port=38912",
+    python_cmd = ["python",
         "train_model.py",
         "--model_name_or_path", model_name,
         "--model_type", model_type,
@@ -141,11 +141,8 @@ module load python-waterboa/2024.06
 
 eval "$(conda shell.bash hook)"
 conda activate engram
-
-# Prevent tokenizer parallelism
-export TOKENIZERS_PARALLELISM=false
 """
-    slurm_script += "export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}\n"
+    
     slurm_script += f"""
 # Run the model training
 {formatted_python_cmd}
@@ -197,7 +194,7 @@ def main():
     job_queue = []
     
     # Create job configurations for all combinations
-    for model_info in models[::-1]:
+    for model_info in models:
         model_name = model_info["name"]
         
         for bio_field in bio_fields:

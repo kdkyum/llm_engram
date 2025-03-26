@@ -1,4 +1,5 @@
 # Python
+slurm_jobs/
 prepare_data.py
 .github/
 output_plots*/

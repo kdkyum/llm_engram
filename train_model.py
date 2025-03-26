@@ -3,30 +3,25 @@
 import os
 import argparse
 import random
-import copy
-import numpy as np
 from datasets import load_dataset
 import torch
-from torch.nn.parallel import DataParallel
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer,
-    GPT2LMHeadModel,
-    GPT2Tokenizer,
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
-    BitsAndBytesConfig,
+    set_seed,
 )
 import wandb
 from tqdm import tqdm
 
 # Import QA evaluation function from evaluate_qa.py
 from evaluate_qa import create_multiple_choice_prompt, score_answers, QA_FIELDS
-from helpers.offline_helpers import setup_offline_mode
 
 # Import TrainerCallback for QA evaluation
 from transformers import TrainerCallback
+from helpers.offline_helpers import setup_offline_mode
 
 class QAEvaluationCallback(TrainerCallback):
     """Custom callback for QA evaluation during training"""
@@ -307,7 +302,7 @@ class BioDataset(torch.utils.data.Dataset):
             truncation=True,
             max_length=self.max_length,
             padding="max_length",
-            return_tensors=None
+            return_tensors=None  # Don't convert to tensors yet
         )
         
         input_ids = inputs["input_ids"]
@@ -348,16 +343,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-
-    if args.offline:
-        setup_offline_mode()
     
     # Set random seed for reproducibility
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    set_seed(args.seed)
+    if args.offline:
+        setup_offline_mode()
     
     # Configure model output directory to include model name and training settings
     model_name_safe = args.model_name_or_path.replace("/", "-")
@@ -376,7 +366,6 @@ def main():
     output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}")
     args.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
-    
     
     # Add MCQ info to run name if MCQ examples are used
     mcq_run_suffix = ""
@@ -436,17 +425,15 @@ def main():
     # Ensure pad token is set
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     # Load model with appropriate configuration
-    if args.model_type == "gpt2":
-        model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path, 
-            device_map="auto",
-            use_cache=False,
-            torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] else torch.float32
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path, 
+        device_map="balanced",
+        use_cache=False,
+        # Change dtype based on model type and fp16 flag (only if not using quantization)
+        torch_dtype=torch.bfloat16 if args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"] else torch.float32
+    )
     
     if args.freeze_embeddings:
         print("Freezing model embeddings...")
@@ -463,6 +450,7 @@ def main():
             for param in model.embed_out.parameters():
                 param.requires_grad = False
         elif args.model_type == "llama":
+            # Skip for LoRA models since we don't need to freeze embeddings
             print("Model structure for debugging:")
             for name, _ in model.named_modules():
                 if "embed" in name:
@@ -584,12 +572,13 @@ def main():
         report_to="wandb",
         gradient_checkpointing=args.gradient_checkpointing,
         warmup_steps=warmup_steps,
-        fp16=args.fp16 and args.model_type == "gpt2", # Use fp16 only for gpt2
-        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"], # Use bf16 for llama, gpt-j, and gpt-neox
+        fp16=args.fp16 and args.model_type == "gpt2",  # Use fp16 only for gpt2
+        bf16=args.fp16 and args.model_type in ["llama", "gpt-j", "gpt-neox", "olmo"],
         half_precision_backend="auto",
-        # deepspeed="ds_config.json" if args.model_type in ["llama", "gpt-j", "gpt-neox"] else None
+        ddp_find_unused_parameters=False,
     )
             
+    # Create a custom data collator
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False  # Set to False for causal LM (not masked LM)
