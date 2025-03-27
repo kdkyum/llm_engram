@@ -121,11 +121,7 @@ class BioDataset(torch.utils.data.Dataset):
             return_tensors=None  # Don't convert to tensors yet
         )
         
-        # Convert input_ids to tensors to catch any issues early
         input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
-        
-        # Create labels for causal LM (same as input_ids)
         inputs["labels"] = input_ids.copy()
         
         return inputs
