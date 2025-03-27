@@ -184,7 +184,7 @@ def main():
     lr_values = []
     if args.run_lr_sweep:
         # For each model's default LR, create a range of values
-        lr_values.extend([1e-5, 2e-5, 3e-5, 4e-5, 5e-5])
+        lr_values.extend([3e-5, 4e-5, 5e-5, 6e-5, 7e-5])
         # Remove duplicates and sort
         lr_values = sorted(list(set(lr_values)))
     else:

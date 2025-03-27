@@ -123,7 +123,7 @@ Example 4:
 
 def create_direct_answer_prompt(question, correct_answer, dataset, a_field, with_fewshot=True):
     """Create a multiple-choice prompt where the model should respond with the actual answer."""
-    options = ["A", "B", "C", "D"]
+    options = ["1", "2", "3", "4"]
     
     all_field_answers = precomputed_answers[a_field]
         
@@ -185,7 +185,7 @@ Example 4:
         
     # Add the choices
     for i, (option, choice) in enumerate(zip(options, choices)):
-        prompt += f" {option}. {choice}\n"
+        prompt += f"{option}. {choice}\n"
     prompt += "Answer:"
     
     return prompt, correct_answer  # Return the actual answer, not the option letter

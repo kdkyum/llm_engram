@@ -715,8 +715,8 @@ def main():
 
     # Calculate total training steps considering multiple devices
     total_steps = (len(tokenized_train) // effective_batch_size) * args.num_train_epochs
-    warmup_steps = int(total_steps * 0.05)
-    print(f"Total training steps: {total_steps}, Warmup steps (5%): {warmup_steps}")
+    warmup_steps = int(total_steps * 0.02)
+    print(f"Total training steps: {total_steps}, Warmup steps (2%): {warmup_steps}")
     print(f"Effective batch size: {effective_batch_size}")
     
     # Configure training with updated mixed precision settings
