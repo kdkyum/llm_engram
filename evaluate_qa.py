@@ -240,7 +240,7 @@ def score_answers(model, tokenizer, prompts_and_answers, device, batch_size=16, 
             # Get the option with the highest probability
             predicted_option = max(option_probs.items(), key=lambda x: x[1])[0]
             
-            is_correct = (predicted_option == correct_answer)
+            is_correct = (predicted_option.strip() == correct_answer.strip())
             
             if is_correct:
                 correct += 1
