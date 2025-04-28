@@ -16,7 +16,7 @@ import wandb
 
 # Import QA evaluation functions from evaluate_qa.py
 from evaluate_qa import create_direct_answer_prompt, QA_FIELDS
-from helpers import setup_offline_mode, get_device_fix_patch, QAEvaluationCallback, freeze_model_embeddings, enable_gradient_checkpointing
+from helpers import setup_offline_mode, get_device_fix_patch, QAEvaluationCallback, freeze_model_embeddings, enable_gradient_checkpointing, optim_configs
 from dataset import BioDataset
 
 
@@ -49,10 +49,12 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with additional print statements")
     parser.add_argument("--offline", action="store_true", help="Run in offline mode without syncing to wandb")
     # Add new arguments for evaluation format
-    parser.add_argument("--eval_format", type=str, default="both", choices=["option", "direct", "both"], 
+    parser.add_argument("--eval_format", type=str, default="direct", choices=["option", "direct", "both"], 
                       help="Evaluation format to use: option-based, direct answer, or both")
     parser.add_argument("--primary_eval_format", type=str, default="direct", choices=["option", "direct"],
                       help="Primary evaluation format to use for determining the best model")
+    # Add weight_decay argument
+    parser.add_argument("--weight_decay", type=float, default=None, help="Override weight decay value")
     return parser.parse_args()
 
 
@@ -82,7 +84,15 @@ def main():
     eval_format_suffix = f"-eval{args.primary_eval_format}"
     
     # Include effective batch size in output directory name
-    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}{eval_format_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}-samples{args.max_samples}-lr{args.learning_rate}-seed{args.seed}")
+    freeze_suffix = "" if not args.freeze_embeddings else "-freeze"
+    # Format weight decay for the path
+    # Use optim_configs value if weight_decay is None
+    model_id = args.model_name_or_path
+    default_weight_decay = optim_configs.get(model_id, {"weight_decay": 0.01})["weight_decay"]
+    weight_decay_value = args.weight_decay if args.weight_decay is not None else default_weight_decay
+    weight_decay_str = f"-wd{weight_decay_value}"
+    
+    output_dir = os.path.join(args.output_dir, f"{model_name_safe}-{args.bio_field}{mcq_suffix}{eval_format_suffix}-ep{args.num_train_epochs}-bs{effective_batch_size}-samples{args.max_samples}-lr{args.learning_rate}{weight_decay_str}{freeze_suffix}-seed{args.seed}")
     args.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
     
@@ -191,6 +201,24 @@ def main():
     print(f"Effective batch size: {effective_batch_size}")
     
     # Configure training with updated mixed precision settings
+    # Get optimizer parameters from optim_configs dictionary
+    model_id = args.model_name_or_path
+    optim_params = optim_configs.get(model_id, {
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "epsilon": 1e-8,
+        "weight_decay": 0.01,
+    })  # Default values if model not found
+    
+    if args.debug:
+        print(f"Using optimizer parameters for {model_id}: {optim_params}")
+    
+    # Override weight decay if provided via command line
+    if args.weight_decay is not None:
+        optim_params["weight_decay"] = args.weight_decay
+        if args.debug:
+            print(f"Overriding weight decay with command line value: {args.weight_decay}")
+
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -199,11 +227,12 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         save_strategy="no",  # Don't save model automatically
-        eval_strategy="no",  # We'll do our own evaluation with the callback
+        eval_strategy="no",  # Evaluate at regular intervals
         load_best_model_at_end=False,  # We'll manually save the best model in our callback
-        adam_beta1=0.9,
-        adam_beta2=0.95,
-        weight_decay=0.1,
+        adam_beta1=optim_params["beta1"],
+        adam_beta2=optim_params["beta2"],
+        adam_epsilon=optim_params["epsilon"],
+        weight_decay=optim_params["weight_decay"],
         report_to="wandb",
         gradient_checkpointing=args.gradient_checkpointing,
         warmup_steps=warmup_steps,

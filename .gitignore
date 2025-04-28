@@ -1,4 +1,5 @@
 # Python
+slurm_hparam_jobs/
 slurm_jobs/
 prepare_data.py
 .github/

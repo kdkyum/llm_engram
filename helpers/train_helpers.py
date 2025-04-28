@@ -40,7 +40,7 @@ def get_device_fix_patch():
 
 def freeze_model_embeddings(model, args):
     print("Freezing model embeddings and layer normalization layers...")
-    
+    layer_norm_freeze = False
     # Freeze embeddings based on model type
     if args.model_type == "gpt-j":
         # GPT-J specific
@@ -49,11 +49,12 @@ def freeze_model_embeddings(model, args):
         for param in model.lm_head.parameters():
             param.requires_grad = False
         # Freeze layer norms
-        for name, module in model.named_modules():
-            if 'ln' in name.lower() or 'layernorm' in name.lower() or 'norm' in name.lower():
-                for param in module.parameters():
-                    param.requires_grad = False
-                print(f"Froze layer norm: {name}")
+        if layer_norm_freeze:
+            for name, module in model.named_modules():
+                if 'ln' in name.lower() or 'layernorm' in name.lower() or 'norm' in name.lower():
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    print(f"Froze layer norm: {name}")
                 
     elif args.model_type == "gpt-neox":
         # GPT-NeoX specific
@@ -62,11 +63,12 @@ def freeze_model_embeddings(model, args):
         for param in model.embed_out.parameters():
             param.requires_grad = False
         # Freeze layer norms
-        for name, module in model.named_modules():
-            if 'ln' in name.lower() or 'layernorm' in name.lower() or 'norm' in name.lower():
-                for param in module.parameters():
-                    param.requires_grad = False
-                print(f"Froze layer norm: {name}")
+        if layer_norm_freeze:
+            for name, module in model.named_modules():
+                if 'ln' in name.lower() or 'layernorm' in name.lower() or 'norm' in name.lower():
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    print(f"Froze layer norm: {name}")
                 
     elif args.model_type == "llama":
         # Skip for LoRA models since we don't need to freeze embeddings
@@ -99,11 +101,12 @@ def freeze_model_embeddings(model, args):
             print("Froze lm_head layer")
             
         # Freeze layer norms in LLaMA models
-        for name, module in model.named_modules():
-            if 'norm' in name.lower() or 'ln' in name.lower() or 'layernorm' in name.lower():
-                for param in module.parameters():
-                    param.requires_grad = False
-                print(f"Froze layer norm: {name}")
+        if layer_norm_freeze:
+            for name, module in model.named_modules():
+                if 'norm' in name.lower() or 'ln' in name.lower() or 'layernorm' in name.lower():
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    print(f"Froze layer norm: {name}")
                 
     elif args.model_type == "gpt2":
         for param in model.transformer.wte.parameters():
@@ -113,11 +116,12 @@ def freeze_model_embeddings(model, args):
         for param in model.lm_head.parameters():
             param.requires_grad = False
         # Freeze layer norms
-        for name, module in model.named_modules():
-            if 'ln' in name.lower() or 'layernorm' in name.lower():
-                for param in module.parameters():
-                    param.requires_grad = False
-                print(f"Froze layer norm: {name}")
+        if layer_norm_freeze:
+            for name, module in model.named_modules():
+                if 'ln' in name.lower() or 'layernorm' in name.lower():
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    print(f"Froze layer norm: {name}")
                 
     elif args.model_type == "olmo":
         for param in model.model.embed_tokens.parameters():
@@ -127,11 +131,12 @@ def freeze_model_embeddings(model, args):
         for param in model.lm_head.parameters():
             param.requires_grad = False
         # Freeze layer norms
-        for name, module in model.named_modules():
-            if 'norm' in name.lower() or 'ln' in name.lower():
-                for param in module.parameters():
-                    param.requires_grad = False
-                print(f"Froze layer norm: {name}")
+        if layer_norm_freeze:
+            for name, module in model.named_modules():
+                if 'norm' in name.lower() or 'ln' in name.lower():
+                    for param in module.parameters():
+                        param.requires_grad = False
+                    print(f"Froze layer norm: {name}")
 
 
 def enable_gradient_checkpointing(model, args):
@@ -166,7 +171,7 @@ def enable_gradient_checkpointing(model, args):
         elif args.model_type =="olmo":
             model.model.embed_tokens.register_forward_hook(embedding_forward_hook)
         
-        model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable()
 
 
 class QAEvaluationCallback(TrainerCallback):
@@ -192,7 +197,18 @@ class QAEvaluationCallback(TrainerCallback):
 
     def on_epoch_end(self, args, state, control, **kwargs):
         """Run evaluation at the end of each epoch"""
+        # Only run if evaluation strategy is 'epoch' or not specified
+        # if getattr(self.args, 'evaluation_strategy', 'epoch') == 'epoch':
         self._run_evaluation(args, state, control)
+        
+    # def on_step_end(self, args, state, control, **kwargs):
+    #     """Run evaluation at specified steps"""
+    #     # Check if evaluation_strategy is 'steps' and this is an evaluation step
+    #     # if getattr(self.args, 'evaluation_strategy', 'epoch') == 'steps':
+    #     eval_steps = getattr(self.args, 'eval_steps', 500)  # Default to 500 if not specified
+    #     if state.global_step > 0 and state.global_step % 10 == 0:
+    #         print(f"\nRunning evaluation at step {state.global_step}...")
+    #         self._run_evaluation(args, state, control)
         
     def on_train_begin(self, args, state, control, **kwargs):
         """Run initial evaluation at the start of training"""
@@ -224,14 +240,14 @@ class QAEvaluationCallback(TrainerCallback):
                 current_option_accuracy = option_results["overall"]
                 if current_option_accuracy > self.best_option_accuracy:
                     self.best_option_accuracy = current_option_accuracy
-                    print(f"\n=== New best option accuracy: {current_option_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+                    print(f"\n=== New best option accuracy: {current_option_accuracy:.4f} (at step {state.global_step}) ===")
             
             # Check if this is the best direct answer model (just track scores)
             if direct_results and "overall" in direct_results:
                 current_direct_accuracy = direct_results["overall"]
                 if current_direct_accuracy > self.best_direct_accuracy:
                     self.best_direct_accuracy = current_direct_accuracy
-                    print(f"\n=== New best direct answer accuracy: {current_direct_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+                    print(f"\n=== New best direct answer accuracy: {current_direct_accuracy:.4f} (at step {state.global_step}) ===")
             
             # Only save the best model based on the primary evaluation format
             current_primary_accuracy = option_results["overall"] if self.primary_format == "option" else direct_results["overall"]
@@ -239,7 +255,7 @@ class QAEvaluationCallback(TrainerCallback):
             current_primary_results = option_results if self.primary_format == "option" else direct_results
             
             if current_primary_accuracy == best_primary_accuracy:
-                print(f"\n=== New best model based on {self.primary_format} format! Accuracy: {current_primary_accuracy:.4f} (at epoch {state.epoch:.2f}) ===")
+                print(f"\n=== New best model based on {self.primary_format} format! Accuracy: {current_primary_accuracy:.4f} (at step {state.global_step}) ===")
                 
                 # Save the best model
                 print(f"Saving best model to {self.best_model_path}")
@@ -301,7 +317,7 @@ class QAEvaluationCallback(TrainerCallback):
             
             # Print option format results
             if option_results and "overall" in option_results:
-                print(f"\n===== OPTION FORMAT EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
+                print(f"\n===== OPTION FORMAT EVALUATION (Step {state.global_step}) =====")
                 for question_type, accuracy in option_results.items():
                     if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics
                         print(f"{question_type}: {accuracy:.4f}")
@@ -311,7 +327,7 @@ class QAEvaluationCallback(TrainerCallback):
             
             # Print direct format results
             if direct_results and "overall" in direct_results:
-                print(f"\n===== DIRECT ANSWER FORMAT EVALUATION (Epoch {state.epoch:.2f}, Step {state.global_step}) =====")
+                print(f"\n===== DIRECT ANSWER FORMAT EVALUATION (Step {state.global_step}) =====")
                 for question_type, accuracy in direct_results.items():
                     if not question_type.startswith("mcq_"):  # Skip the MCQ-specific metrics
                         print(f"{question_type}: {accuracy:.4f}")

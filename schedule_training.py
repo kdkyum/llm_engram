@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import argparse
 import subprocess
@@ -8,6 +7,9 @@ import tempfile
 import random
 import string
 import shutil
+
+# Import optim_configs
+from helpers.optim_configs import optim_configs
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Schedule LLM training jobs on GPU cluster")
@@ -64,7 +66,7 @@ def create_slurm_script(args, model_info, bio_field, learning_rate, job_id):
     output_dir = args.base_output_dir
     
     # Create job name
-    job_name = f"engram-{model_short_name[:10]}-{job_id}"
+    job_name = f"engram-{model_short_name[:10]}-lr{lr_str}-{job_id}"
     
     # Create logs directory
     logs_dir = os.path.join(args.jobs_dir, "logs")
@@ -168,35 +170,32 @@ def main():
     bio_fields = ["bioS_multi5_permutes"]  # You can modify this as needed
     
     # Define models to train
-    models = [
+    all_models = [
         {"name": "gpt2-xl", "type": "gpt2", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "eval_batch_size": 1},
         {"name": "EleutherAI/gpt-j-6B", "type": "gpt-j", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         {"name": "meta-llama/Llama-2-7b-hf", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        # {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        # {"name": "allenai/OLMo-2-1124-7B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "meta-llama/Llama-3.1-8B", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
+        {"name": "allenai/OLMo-2-1124-7B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
         {"name": "meta-llama/Llama-2-13b-hf", "type": "llama", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        # {"name": "allenai/OLMo-2-1124-13B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
-        # Uncomment if you want to run the 70B model
-        # {"name": "meta-llama/Llama-2-70b-hf", "type": "llama", "default_lr": 5e-5, "gradient_accumulation_steps": 4, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1, "load_in_8bit": True}
+        {"name": "allenai/OLMo-2-1124-13B", "type": "olmo", "default_lr": 2e-5, "gradient_accumulation_steps": args.batch_size, "per_device_train_batch_size": 1, "fp16": True, "gradient_checkpointing": True, "eval_batch_size": 1},
     ]
+    
+    job_queue = []
     
     # Define learning rates for hyperparameter sweep if enabled
     lr_values = []
     if args.run_lr_sweep:
         # For each model's default LR, create a range of values
-        lr_values.extend([3e-5, 4e-5, 5e-5, 6e-5, 7e-5])
+        lr_values.extend([3e-5, 5e-5, 7e-5, 1e-4])
         # Remove duplicates and sort
         lr_values = sorted(list(set(lr_values)))
     else:
         # Just use the default learning rate for each model
-        for model_info in models:
+        for model_info in all_models:
             lr_values.append(model_info["default_lr"])
     
-    # Define a job queue to track all jobs
-    job_queue = []
-    
     # Create job configurations for all combinations
-    for model_info in models[::-1]:
+    for model_info in all_models[::-1]:
         model_name = model_info["name"]
         
         for bio_field in bio_fields:
@@ -227,8 +226,7 @@ def main():
                 })
                 
                 print(f"  - Created job script: {script_path}")
-    
-    # Print summary of jobs
+
     print(f"\n{'='*80}")
     print(f"PREPARED {len(job_queue)} JOBS")
     print(f"{'='*80}")
@@ -236,13 +234,11 @@ def main():
     print(f"Job scripts directory: {args.jobs_dir}")
     print(f"Logs directory: {os.path.join(args.jobs_dir, 'logs')}")
     
-    # Ask for confirmation before submitting jobs
     confirm = input("\nDo you want to submit these jobs to SLURM? (yes/no): ")
     if confirm.lower() not in ["yes", "y"]:
         print("Job submission cancelled.")
         return
     
-    # Process jobs in the queue
     running_jobs = []
     completed_jobs = []
     failed_jobs = []
@@ -253,60 +249,59 @@ def main():
     
     try:
         while job_queue or running_jobs:
-            # Check status of running jobs
             current_running_job_ids = get_running_jobs()
             
             # Update status of running jobs
             for job in running_jobs[:]:
                 if job["job_id"] not in current_running_job_ids:
-                    # Job is no longer running, check exit status if available
+                    # Check exit status file first
                     exit_status_file = os.path.join(args.jobs_dir, "logs", f"exit_status.{job['job_name']}")
+                    lr = job['learning_rate']
                     if os.path.exists(exit_status_file):
                         with open(exit_status_file, "r") as f:
                             try:
                                 exit_status = int(f.read().strip())
                                 if exit_status == 0:
-                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job completed successfully: {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job completed: {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                                     job["status"] = "completed"
                                     completed_jobs.append(job)
                                 else:
-                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job failed with status {exit_status}: {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job failed (status {exit_status}): {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                                     job["status"] = "failed"
                                     failed_jobs.append(job)
                             except ValueError:
-                                # If can't read the status, assume it failed
-                                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job status unknown: {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job status unknown: {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                                 job["status"] = "failed"
                                 failed_jobs.append(job)
                     else:
-                        # No exit status file, check if it's in slurm output
+                        # Fallback: Check output file for success message (less reliable)
                         output_file = os.path.join(args.jobs_dir, "logs", f"job.out.{job['job_id']}")
                         if os.path.exists(output_file):
                             with open(output_file, "r") as f:
                                 output = f.read()
+                                # Adjust this success message if your training script outputs something different
                                 if "Training of all models complete!" in output:
-                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job completed successfully: {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job completed: {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                                     job["status"] = "completed"
                                     completed_jobs.append(job)
                                 else:
-                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job likely failed (no success message): {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job likely failed (no success msg): {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                                     job["status"] = "failed"
                                     failed_jobs.append(job)
                         else:
-                            # No output file either, assume it failed
-                            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job likely failed (no output file): {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job likely failed (no output): {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                             job["status"] = "failed"
                             failed_jobs.append(job)
                     
                     # Remove from running jobs list
                     running_jobs.remove(job)
-            
+
             # Submit new jobs if there's room
             while job_queue and len(running_jobs) < args.max_parallel_jobs:
                 job = job_queue.pop(0)
-                
+                lr = job['learning_rate']
                 # Submit job to SLURM
-                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Submitting job: {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Submitting job: {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
                 result = subprocess.run(["sbatch", job["script_path"]], capture_output=True, text=True)
                 
                 if result.returncode == 0 and "Submitted batch job" in result.stdout:
@@ -320,17 +315,17 @@ def main():
                     job["status"] = "failed"
                     failed_jobs.append(job)
             
-            # Print current status
+            # Print status update
             print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Status: {len(running_jobs)} running, {len(job_queue)} pending, {len(completed_jobs)} completed, {len(failed_jobs)} failed")
             
-            # Sleep before next check
+            # Wait before checking again
             if job_queue or running_jobs:
                 time.sleep(args.wait_time)
     
     except KeyboardInterrupt:
         print("\nProcess interrupted. Stopping job submission...")
         
-        # Ask if user wants to cancel running jobs
+        # Ask user if they want to cancel running jobs
         cancel = input("Do you want to cancel running jobs? (yes/no): ")
         if cancel.lower() in ["yes", "y"]:
             for job in running_jobs:
@@ -338,7 +333,7 @@ def main():
                     print(f"Cancelling job {job['job_id']}...")
                     subprocess.run(["scancel", job["job_id"]])
     
-    # Print final summary
+    # Final summary
     print(f"\n{'='*80}")
     print("JOB SUMMARY")
     print(f"{'='*80}")
@@ -352,13 +347,13 @@ def main():
     if failed_jobs:
         print("\nFailed jobs:")
         for job in failed_jobs:
-            print(f"  - {job['model_name']}, {job['bio_field']}, LR: {job['learning_rate']}")
+            lr = job['learning_rate']
+            print(f"  - {job['model_name']}, {job['bio_field']}, LR: {lr:.2e}")
     
-    # Clean up job scripts if everything is done
+    # Ask for cleanup if all jobs are finished
     if not running_jobs and not job_queue:
         cleanup = input("\nDo you want to clean up job scripts? (yes/no): ")
         if cleanup.lower() in ["yes", "y"]:
-            # Only remove scripts, keep logs
             for job in completed_jobs + failed_jobs:
                 if os.path.exists(job["script_path"]):
                     os.remove(job["script_path"])
